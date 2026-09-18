@@ -81,7 +81,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.9.2"
+VERSION = "0.9.3"
 
 # Overridable for tests / parallel installs; default is the shared user daemon.
 # The dir keeps the old "firebase-ports" name: pre-rename binaries still installed
@@ -1298,7 +1298,10 @@ SCRUB_EXACT = {
     "FBPORTS_LEASE_ID", "FBPORTS_BLOCK_BASE",
     "METRO_PORT", "DETOX_UDID", "DETOX_SIM_NAME", "AGENT_SIM_UDID",
 }
-SCRUB_PREFIXES = ("LLM_CACHE", "EMULATOR_")
+# LLM_ is the whole family, not LLM_CACHE: 2026-09-13 a session that built
+# replay-only mode started the daemon with LLM_REPLAY_ONLY=1, and for five days
+# every native e2e suite threw on its first OpenAI call instead of replying.
+SCRUB_PREFIXES = ("LLM_", "EMULATOR_")
 SCRUB_SUFFIXES = ("_EMULATOR_HOST", "_EMULATOR_PORT")
 
 

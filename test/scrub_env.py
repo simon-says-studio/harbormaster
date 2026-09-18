@@ -22,6 +22,7 @@ def check(name, ok):
 env = {
     "PATH": "/usr/bin", "HOME": "/Users/x", "FBPORTS_PORT": "4999", "FBPORTS_STATE_DIR": "/tmp/s",
     "TEST_NOW_MS": "1784000000000", "LLM_CACHE": "1", "LLM_CACHE_DIR": "/c", "LLM_CACHE_USAGE_LOG": "/l",
+    "LLM_REPLAY_ONLY": "1",
     "FIRESTORE_EMULATOR_HOST": "127.0.0.1:11021", "FIREBASE_AUTH_EMULATOR_HOST": "127.0.0.1:11020",
     "EMULATOR_FIRESTORE_PORT": "11021", "GCLOUD_PROJECT": "impulse-mode", "FUNCTIONS_EMULATOR": "true",
     "METRO_PORT": "11031", "DETOX_UDID": "ABC", "DETOX_SIM_NAME": "run-1", "FBPORTS_LEASE_ID": "x", "FBPORTS_BLOCK_BASE": "11000",
@@ -29,7 +30,7 @@ env = {
 out = hm.scrubbed_env(env)
 check("daemon config and the basics survive", {"PATH", "HOME", "FBPORTS_PORT", "FBPORTS_STATE_DIR"} <= set(out))
 check("the frozen test clock does not", "TEST_NOW_MS" not in out)
-check("nor any LLM_CACHE* knob", not any(k.startswith("LLM_CACHE") for k in out))
+check("nor any LLM_* knob (cache, replay-only, whatever comes next)", not any(k.startswith("LLM_") for k in out))
 check("nor anything pointing at an emulator", not any(k.endswith("_EMULATOR_HOST") or k.endswith("_EMULATOR_PORT") or k.startswith("EMULATOR_") for k in out))
 check("nor a project / functions-emulator marker", "GCLOUD_PROJECT" not in out and "FUNCTIONS_EMULATOR" not in out)
 check("nor what a lease hands out", not ({"METRO_PORT", "DETOX_UDID", "DETOX_SIM_NAME", "FBPORTS_LEASE_ID", "FBPORTS_BLOCK_BASE"} & set(out)))

@@ -124,3 +124,16 @@ while a container holds it. Simon Says' local Supabase stacks are containers
 on harbormaster blocks. On simon-linux-1 (2026-10-09), four jobs were handed a
 block a stack still held. No docker means the empty set, never a failure.
 `python3 test/docker_ports.py`.
+
+## A managed broker (0.11.0)
+
+`harbormaster serve --managed` is for a broker that a service manager
+(systemd, launchd) runs and restarts. It keeps a marker in the state dir
+fresh, touched every minute. While the marker is fresh, clients never replace
+the broker, even an older one, and never spawn their own. If it is briefly
+down, they wait up to 45 s for the service manager to bring it back. Upgrades
+are the service manager's job: restart it after installing a new version. A
+stale marker means the service is gone, and clients spawn as before. Without
+this, the broker belonged to whichever client happened to start it: on
+simon-linux-1 that was a CI job, whose orphan cleanup killed the broker and
+every emulator it ran for other jobs mid-suite. `python3 test/managed.py`.

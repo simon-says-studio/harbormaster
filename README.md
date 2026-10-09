@@ -114,3 +114,13 @@ daemon. Harbormaster therefore strips test-only and emulator-pointing variables
 `GCLOUD_PROJECT`, and the values a lease hands out) both when spawning the
 daemon and when it starts serving. A suite that needs one of these gets it
 explicitly: `acquire --fn-env TEST_NOW_MS=...`.
+
+## A block docker holds is not free (0.10.0)
+
+Free-block selection also asks `docker ps` which host ports are published. On
+Linux, dockerd publishes a container's ports through iptables and, without the
+userland proxy, nothing listens on them, so a connect finds the port quiet
+while a container holds it. Simon Says' local Supabase stacks are containers
+on harbormaster blocks. On simon-linux-1 (2026-10-09), four jobs were handed a
+block a stack still held. No docker means the empty set, never a failure.
+`python3 test/docker_ports.py`.

@@ -59,7 +59,9 @@ independent suites, so they never collide on ports or data.
         JVMs / functions workers re-parented to pid 1), stray run-*/alloc-* sims.
         --fix evicts them; exits 1 when findings remain unfixed. The daemon runs
         the same sweep itself at startup and every FBPORTS_SWEEP_INTERVAL (300s).
-  serve                  Run the daemon (auto-starts on first command).
+  serve [--managed]      Run the daemon (auto-starts on first command). --managed: a service
+                         manager (systemd/launchd) runs and restarts it; clients then never
+                         replace or spawn a broker while its marker is fresh.
 
 NOTE: firebase.json ports are optional — the daemon injects (and overrides) a
 per-lease pool block, so concurrent suites never collide. Ledger:
@@ -82,7 +84,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.10.0"
+VERSION = "0.11.0"
 
 # Overridable for tests / parallel installs; default is the shared user daemon.
 # The dir keeps the old "firebase-ports" name: pre-rename binaries still installed
@@ -1246,8 +1248,43 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self._send(500, {"error": str(e)})
 
 
-def cmd_serve():
+# A MANAGED broker (0.11.0): one a service manager runs and keeps alive —
+# `harbormaster serve --managed` under systemd or launchd. Its marker in the
+# state dir is touched every minute; while it is fresh, clients never replace
+# the broker and never spawn their own: the service manager owns its lifecycle
+# and its upgrades. Without this, the broker belonged to whichever client
+# happened to start it. On simon-linux-1 (2026-10-09) that was an SSB job's own
+# checkout inside the runner's systemd unit, and before it a CI job, whose
+# orphan cleanup killed the broker — and every emulator it ran for OTHER jobs —
+# mid-suite. A stale marker means the service is gone: clients spawn as before.
+MANAGED_MARK = STATE_DIR / "managed"
+MANAGED_FRESH_S = 300
+
+
+def _managed_recent():
+    try:
+        return time.time() - MANAGED_MARK.stat().st_mtime < MANAGED_FRESH_S
+    except OSError:
+        return False
+
+
+def _touch_managed():
+    try:
+        MANAGED_MARK.write_text(json.dumps({"pid": os.getpid(), "version": VERSION, "exe": str(Path(__file__).resolve())}))
+    except OSError:
+        pass
+
+
+def cmd_serve(managed=False):
     STATE_DIR.mkdir(parents=True, exist_ok=True)
+    if managed:
+        _touch_managed()
+
+        def keep_marked():
+            while True:
+                time.sleep(60)
+                _touch_managed()
+        threading.Thread(target=keep_marked, daemon=True).start()
     dropped = _scrub_environ()
     if dropped:
         print(f"harbormaster: scrubbed inherited env before serving: {', '.join(dropped)}", flush=True)
@@ -1362,8 +1399,11 @@ def _spawn_daemon():
 
 def _ensure():
     v = _daemon_version()
+    managed = _managed_recent()
     if v is not None:
-        if _ver_tuple(v) >= _ver_tuple(VERSION):
+        # A managed broker is never replaced by a client: its service manager
+        # owns upgrades (restart it to pick up a new install).
+        if managed or _ver_tuple(v) >= _ver_tuple(VERSION):
             return
         # A newer client found an older daemon (e.g. a stale node_modules copy
         # started it). Replace it: leases persist in the ledger and every leased
@@ -1381,6 +1421,14 @@ def _ensure():
             raise RuntimeError(
                 f"daemon {v} is older than this client ({VERSION}) and did not "
                 f"shut down — kill the 'harbormaster serve' process and retry")
+    if managed:
+        # Down, but a service runs it: it is restarting. Wait for it rather than
+        # start one of our own that would die with this client.
+        for _ in range(450):
+            if _up():
+                return
+            time.sleep(0.1)
+        print("harbormaster: the managed broker did not come back in 45s — starting one here", file=sys.stderr)
     _spawn_daemon()
     for _ in range(50):
         if _up():
@@ -1494,7 +1542,7 @@ def main():
     if cmd == "version":
         print(VERSION)
     elif cmd == "serve":
-        cmd_serve()
+        cmd_serve(managed="managed" in flags)
     elif cmd in ("acquire", "up"):
         _ensure()
         pid, start = _owner(opts)

@@ -84,7 +84,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.11.0"
+VERSION = "0.11.1"
 
 # Overridable for tests / parallel installs; default is the shared user daemon.
 # The dir keeps the old "firebase-ports" name: pre-rename binaries still installed
@@ -1423,12 +1423,15 @@ def _ensure():
                 f"shut down — kill the 'harbormaster serve' process and retry")
     if managed:
         # Down, but a service runs it: it is restarting. Wait for it rather than
-        # start one of our own that would die with this client.
-        for _ in range(450):
+        # start one of our own that would die with this client. Two minutes: a
+        # busy box's startup sweep is not quick — the studio's first managed
+        # start reaped 75 leftovers and served after ~40 s (2026-10-09), and a
+        # client that gives up early starts a broker that fights the service.
+        for _ in range(1200):
             if _up():
                 return
             time.sleep(0.1)
-        print("harbormaster: the managed broker did not come back in 45s — starting one here", file=sys.stderr)
+        print("harbormaster: the managed broker did not come back in 120s — starting one here", file=sys.stderr)
     _spawn_daemon()
     for _ in range(50):
         if _up():

@@ -71,6 +71,7 @@ import http.server
 import json
 import os
 import signal
+import re
 import socket
 import shutil
 import subprocess
@@ -81,7 +82,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.9.3"
+VERSION = "0.10.0"
 
 # Overridable for tests / parallel installs; default is the shared user daemon.
 # The dir keeps the old "firebase-ports" name: pre-rename binaries still installed
@@ -183,6 +184,33 @@ def _port_open(port, host="127.0.0.1"):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(0.5)
         return s.connect_ex((host, int(port))) == 0
+
+
+# THE PORTS DOCKER PUBLISHES, asked of docker itself. A connect is not enough:
+# on Linux dockerd publishes a container's port through iptables and, with no
+# userland proxy, nothing LISTENS on it — `_port_open` finds the port quiet
+# while a container holds it. Simon Says' local Supabase stacks (20-port blocks,
+# one per job) are containers; on simon-linux-1 (2026-10-09) four jobs in a row
+# were handed a block a stack still held and died on "address already in use".
+# One `docker ps` per allocation; no docker, or one that will not answer, is the
+# empty set — never a failure.
+_PUBLISHED_RE = re.compile(r":(\d+)(?:-(\d+))?->")
+
+
+def _parse_published(text):
+    out = set()
+    for m in _PUBLISHED_RE.finditer(text or ""):
+        a = int(m.group(1)); b = int(m.group(2)) if m.group(2) else a
+        out.update(range(a, min(b, a + 999) + 1))
+    return out
+
+
+def _docker_published_ports():
+    try:
+        r = subprocess.run(["docker", "ps", "--format", "{{.Ports}}"], capture_output=True, text=True, timeout=10)
+        return _parse_published(r.stdout) if r.returncode == 0 else set()
+    except (OSError, subprocess.SubprocessError):
+        return set()
 
 
 def _all_open(ports):
@@ -627,9 +655,14 @@ class Broker:
 
     def _free_block(self):
         used = {l["block"] for l in self.leases.values() if l.get("block")}
+        published = _docker_published_ports()
         for i in range(POOL_BLOCKS):
             base = POOL_BASE + i * BLOCK
-            if base not in used and all(not _port_open(base + off) for off in range(BLOCK)):
+            if base in used:
+                continue
+            if any(base + off in published for off in range(BLOCK)):
+                continue
+            if all(not _port_open(base + off) for off in range(BLOCK)):
                 return base
         raise RuntimeError("emulator port pool exhausted")
 

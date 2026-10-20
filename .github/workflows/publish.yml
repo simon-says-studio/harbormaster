@@ -1,0 +1,50 @@
+name: Publish
+
+# npm trusted publishing (simon-says docs/NPM-PUBLISHING.md, 2026-10-20): a
+# version on main that npm does not have yet is published by this workflow,
+# proved to npm by GitHub's OIDC token. No npm token, no 2FA prompt. Bump
+# VERSION and package.json together in a PR; the merge publishes it.
+on:
+  push:
+    branches: [main]
+    paths: [package.json]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    # GitHub-hosted on purpose: npm accepts trusted publishing only from
+    # GitHub-hosted runners. Publishing only, about a minute, no secrets.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: npm install -g npm@latest && npm --version
+      - name: Publish this version if npm does not have it
+        run: |
+          set -euo pipefail
+          name=$(node -p "require('./package.json').name")
+          ver=$(node -p "require('./package.json').version")
+          script=$(sed -n 's/^VERSION = "\(.*\)"$/\1/p' harbormaster)
+          if [ "${ver}" != "${script}" ]; then
+            echo "::error::package.json says ${ver}, harbormaster's VERSION says ${script}: bump them together"; exit 1
+          fi
+          if npm view "${name}@${ver}" version >/dev/null 2>&1; then echo "${name}@${ver} is already on npm"; exit 0; fi
+          for t in test/managed.py test/idle_sims.py test/project_env.py test/scrub_env.py test/docker_ports.py; do
+            python3 "${t}"
+          done
+          npm publish --access public
+          echo "::notice::published ${name}@${ver}"

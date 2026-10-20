@@ -27,11 +27,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/simon-says-build/harbormaster.git"
+    "url": "git+https://github.com/simon-says-studio/harbormaster.git"
   },
-  "homepage": "https://github.com/simon-says-build/harbormaster#readme",
+  "homepage": "https://github.com/simon-says-studio/harbormaster#readme",
   "bugs": {
-    "url": "https://github.com/simon-says-build/harbormaster/issues"
+    "url": "https://github.com/simon-says-studio/harbormaster/issues"
   },
   "os": [
     "darwin",

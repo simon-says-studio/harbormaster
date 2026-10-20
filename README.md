@@ -154,3 +154,23 @@ extensions) in other directories. `acquire`: on top of the daemon's scrubbed
 env, under the caller's explicit `--fn-env`. `exec`: on top of the caller's
 ambient env, so a key exported in some shell can't leak into the suite.
 `python3 test/project_env.py`.
+
+## An idle simulator nobody leases is shut down (0.13.0)
+
+The world sweep (every `FBPORTS_SWEEP_INTERVAL`, 5 min) now shuts down a
+booted simulator that meets all three conditions:
+
+- **no lease holds it**;
+- **booted longer than `FBPORTS_IDLE_SIM_HOURS`** (default 6; `0` turns this
+  off), measured by its `launchd_sim`;
+- **no app is running in it**.
+
+It is shut down only, never deleted, so whoever booted it can boot it again.
+
+On 2026-10-20 "Impulse-agent" had sat on the Mac Studio for 32 hours,
+booted outside any lease by an app's pinned simulator name, holding two of
+its ten cores with no app installed. Leases stopped only what they created.
+
+`status` reports what the sweep last saw and did: `idleSims {booted, unleased,
+shutDown[]}`. The CLI prints a `simulators:` line. Tested by
+`python3 test/idle_sims.py`.

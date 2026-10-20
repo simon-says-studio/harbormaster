@@ -84,7 +84,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.12.0"
+VERSION = "0.13.0"
 
 # Overridable for tests / parallel installs; default is the shared user daemon.
 # The dir keeps the old "firebase-ports" name: pre-rename binaries still installed
@@ -125,6 +125,11 @@ BOOT_BACKSTOP = 600          # only for a genuinely wedged boot; readiness is li
 # How often the daemon sweeps the WORLD for resources that escaped the ledger:
 # listeners on pool ports with no lease, orphaned firebase runtimes, stray sims.
 SWEEP_INTERVAL = int(os.environ.get("FBPORTS_SWEEP_INTERVAL", "300"))
+# A booted simulator NO lease holds, up this long with no app running in it, is
+# shut down (never deleted: its owner can boot it again). 0 turns it off.
+# 2026-10-20: "Impulse-agent", booted outside any lease by an app's pinned
+# simulator name, held two of the Mac Studio's ten cores for 32 hours.
+IDLE_SIM_HOURS = float(os.environ.get("FBPORTS_IDLE_SIM_HOURS", "6"))
 # Process-name signatures of firebase-tools' own children. firebase-tools spawns
 # these `detached: true` — their OWN process groups — so killpg on the suite can
 # structurally never reach them (the v1 "killpg fixes it" assumption was wrong:
@@ -457,6 +462,57 @@ def _sim_inventory():
     except (subprocess.SubprocessError, OSError, json.JSONDecodeError,
             AttributeError, TypeError):
         return None
+
+
+def _etime_s(etime):
+    """ps etime ([[dd-]hh:]mm:ss) in seconds, or None."""
+    try:
+        days, _, rest = etime.strip().rpartition("-")
+        parts = [int(x) for x in rest.split(":")]
+        while len(parts) < 3:
+            parts.insert(0, 0)
+        return (int(days) if days else 0) * 86400 + parts[0] * 3600 + parts[1] * 60 + parts[2]
+    except (ValueError, AttributeError):
+        return None
+
+
+_DEVICE_RE = re.compile(r"/CoreSimulator/Devices/([0-9A-Fa-f-]{36})/")
+
+
+def _booted_sims(ps_text):
+    """{udid: {"upS": seconds its launchd_sim has run, "app": an app is running}}
+    for every booted simulator, read off one `ps -axo etime=,command=` listing.
+    A device's launchd_sim is its boot; a process under its
+    data/Containers/Bundle/Application is an app running in it."""
+    out = {}
+    for line in ps_text.splitlines():
+        etime, _, cmd = line.strip().partition(" ")
+        m = _DEVICE_RE.search(cmd)
+        if not m:
+            continue
+        udid = m.group(1).upper()
+        d = out.setdefault(udid, {"upS": None, "app": False})
+        if "launchd_sim" in cmd.split(" ", 1)[0]:
+            up = _etime_s(etime)
+            if up is not None:
+                d["upS"] = max(d["upS"] or 0, up)
+        if "/data/Containers/Bundle/Application/" in cmd:
+            d["app"] = True
+    return out
+
+
+def idle_unleased_sims(booted, leased, names, hours=IDLE_SIM_HOURS):
+    """The booted simulators to shut down: no lease holds them, up longer than
+    `hours`, and no app running. Pure. `names` is {udid: name} (for the report)."""
+    if not hours or hours <= 0:
+        return []
+    out = []
+    for udid, d in booted.items():
+        if udid in leased or d.get("app") or d.get("upS") is None:
+            continue
+        if d["upS"] >= hours * 3600:
+            out.append({"udid": udid, "name": names.get(udid, ""), "upH": round(d["upS"] / 3600, 1)})
+    return out
 
 
 def _group_alive(pgid):
@@ -997,7 +1053,10 @@ class Broker:
                                 "ports": l["ports"], "projectId": l.get("project_id"),
                                 "sim": l.get("sim_udid"), "expires": l.get("expires"),
                                 "label": l.get("label"), "log": l.get("log")}
-                               for l in self.leases.values()]}
+                               for l in self.leases.values()],
+                    # What the idle-simulator sweep last saw and did (SSB's Hosts
+                    # card reads it: a leak is a number, not a chart to diagnose).
+                    "idleSims": getattr(self, "_idle_sims", None)}
 
     def reap(self):
         with self.lock:
@@ -1143,6 +1202,8 @@ class Broker:
                         and udid not in leased_udids):
                     findings.append({"kind": "sim", "udid": udid, "name": name,
                                      "evict": udid in mine})
+        if apply:
+            self._sweep_idle_sims(inv)
         if apply and findings:
             pids = {f["pid"] for f in findings
                     if f["kind"] in ("listener", "orphan") and f.get("evict")}
@@ -1177,6 +1238,35 @@ class Broker:
                           + (f" port {f['port']}" if f.get("port") else "")
                           + f" — {f['cmd']}", flush=True)
         return findings
+
+    def _sweep_idle_sims(self, inv):
+        """Shut down booted simulators no lease holds that have sat idle past
+        IDLE_SIM_HOURS. Shutdown only — the device and its data stay, and its
+        owner boots it again. Recorded for status whatever it finds."""
+        if not IDLE_SIM_HOURS or IDLE_SIM_HOURS <= 0:
+            return
+        try:
+            r = subprocess.run(["ps", "-axo", "etime=,command="], capture_output=True, text=True, timeout=10)
+        except (subprocess.SubprocessError, OSError):
+            return
+        booted = _booted_sims(r.stdout)
+        leased = {str(l.get("sim_udid")).upper() for l in self.leases.values() if l.get("sim_udid")}
+        names = {u.upper(): n for u, n in (inv or {}).items()}
+        idle = idle_unleased_sims(booted, leased, names)
+        done = []
+        for s in idle:
+            try:
+                subprocess.run(["xcrun", "simctl", "shutdown", s["udid"]], capture_output=True, text=True, timeout=60)
+                done.append(s)
+                print(f"idle sim {s['name'] or '?'} ({s['udid'][:8]}) shut down: no lease, "
+                      f"booted {s['upH']}h, no app running", flush=True)
+            except (subprocess.SubprocessError, OSError) as e:
+                print(f"idle sim {s['udid'][:8]}: shutdown failed: {e}", flush=True)
+        unleased = [u for u in booted if u not in leased]
+        prev = getattr(self, "_idle_sims", None) or {}
+        self._idle_sims = {"at": time.time(), "booted": len(booted), "unleased": len(unleased),
+                           "afterHours": IDLE_SIM_HOURS,
+                           "shutDown": (done + (prev.get("shutDown") or []))[:20]}
 
     def doctor(self, fix=False):
         """Report (and with fix=True, evict) everything the sweep can see —
@@ -1728,7 +1818,13 @@ def main():
         if not _up():
             print("daemon not running.")
             return
-        leases = _call("GET", "/status")[1].get("leases", [])
+        st = _call("GET", "/status")[1]
+        leases = st.get("leases", [])
+        idle = st.get("idleSims")
+        if idle:
+            print(f"simulators: {idle['booted']} booted, {idle['unleased']} with no lease"
+                  + (f"; shut down idle: " + ", ".join(f"{x['name'] or x['udid'][:8]} ({x['upH']}h)" for x in idle["shutDown"][:5])
+                     if idle.get("shutDown") else ""))
         if not leases:
             print("nothing out.")
             return

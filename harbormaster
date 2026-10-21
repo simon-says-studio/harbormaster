@@ -84,7 +84,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.13.0"
+VERSION = "0.14.0"
 
 # Overridable for tests / parallel installs; default is the shared user daemon.
 # The dir keeps the old "firebase-ports" name: pre-rename binaries still installed
@@ -130,6 +130,14 @@ SWEEP_INTERVAL = int(os.environ.get("FBPORTS_SWEEP_INTERVAL", "300"))
 # 2026-10-20: "Impulse-agent", booted outside any lease by an app's pinned
 # simulator name, held two of the Mac Studio's ten cores for 32 hours.
 IDLE_SIM_HOURS = float(os.environ.get("FBPORTS_IDLE_SIM_HOURS", "6"))
+# idb's per-simulator companions (0.14.0): one `idb_companion --udid <UDID>`
+# and its /tmp/idb/<UDID>_companion.sock per device it ever drove. A lease
+# deletes its simulator; nothing ended the companion. One older than the grace
+# whose device no longer exists is ended, and a socket for a gone device that no
+# companion holds is removed. The grace keeps a just-created device (newer than
+# the inventory read) out of it.
+IDB_SOCK_DIR = os.environ.get("FBPORTS_IDB_DIR", "/tmp/idb")
+COMPANION_GRACE_S = 600
 # Process-name signatures of firebase-tools' own children. firebase-tools spawns
 # these `detached: true` — their OWN process groups — so killpg on the suite can
 # structurally never reach them (the v1 "killpg fixes it" assumption was wrong:
@@ -512,6 +520,47 @@ def idle_unleased_sims(booted, leased, names, hours=IDLE_SIM_HOURS):
             continue
         if d["upS"] >= hours * 3600:
             out.append({"udid": udid, "name": names.get(udid, ""), "upH": round(d["upS"] / 3600, 1)})
+    return out
+
+
+_COMPANION_UDID_RE = re.compile(r"--udid[ =]([0-9A-Fa-f-]{36})")
+_SOCK_RE = re.compile(r"^([0-9A-Fa-f-]{36})_companion\.sock$")
+
+
+def _companions(ps_text):
+    """[{pid, udid, upS}] for every idb_companion bound to one simulator, read off
+    one `ps -xo pid=,etime=,command=` listing."""
+    out = []
+    for line in ps_text.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3 or "idb_companion" not in parts[2].split(" ", 1)[0]:
+            continue
+        m = _COMPANION_UDID_RE.search(parts[2])
+        if not m:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        out.append({"pid": pid, "udid": m.group(1).upper(), "upS": _etime_s(parts[1])})
+    return out
+
+
+def dead_companions(companions, known, grace=COMPANION_GRACE_S):
+    """The companions to end: their device is not in `known` (every simulator's
+    UDID, upper-case) and they are older than `grace`. Pure."""
+    return [c for c in companions
+            if c["udid"] not in known and c.get("upS") is not None and c["upS"] >= grace]
+
+
+def stale_companion_sockets(names, known, live):
+    """The socket file names to remove: a device not in `known` that no live
+    companion (`live`, UDIDs) holds. Pure."""
+    out = []
+    for n in names:
+        m = _SOCK_RE.match(n)
+        if m and m.group(1).upper() not in known and m.group(1).upper() not in live:
+            out.append(n)
     return out
 
 
@@ -1056,7 +1105,8 @@ class Broker:
                                for l in self.leases.values()],
                     # What the idle-simulator sweep last saw and did (SSB's Hosts
                     # card reads it: a leak is a number, not a chart to diagnose).
-                    "idleSims": getattr(self, "_idle_sims", None)}
+                    "idleSims": getattr(self, "_idle_sims", None),
+                    "companions": getattr(self, "_companions", None)}
 
     def reap(self):
         with self.lock:
@@ -1204,6 +1254,7 @@ class Broker:
                                      "evict": udid in mine})
         if apply:
             self._sweep_idle_sims(inv)
+            self._sweep_companions(inv)
         if apply and findings:
             pids = {f["pid"] for f in findings
                     if f["kind"] in ("listener", "orphan") and f.get("evict")}
@@ -1267,6 +1318,46 @@ class Broker:
         self._idle_sims = {"at": time.time(), "booted": len(booted), "unleased": len(unleased),
                            "afterHours": IDLE_SIM_HOURS,
                            "shutDown": (done + (prev.get("shutDown") or []))[:20]}
+
+    def _sweep_companions(self, inv):
+        """End idb companions whose simulator is gone and remove their sockets.
+        Skipped when the inventory is indeterminate: an empty or failed
+        `simctl list` must never read as "every device is gone"."""
+        if not inv:
+            return
+        try:
+            r = subprocess.run(["ps", "-xo", "pid=,etime=,command="], capture_output=True, text=True, timeout=10)
+        except (subprocess.SubprocessError, OSError):
+            return
+        comps = _companions(r.stdout)
+        dead = dead_companions(comps, {u.upper() for u in inv})
+        if dead:
+            # Re-read: a device created since the first read keeps its companion.
+            again = _sim_inventory()
+            dead = dead_companions(dead, {u.upper() for u in again}) if again else []
+        killed = sorted(_kill_wave({c["pid"] for c in dead})) if dead else []
+        if killed:
+            print(f"idb companions ended (device gone): {len(killed)} — "
+                  + ", ".join(c["udid"][:8] for c in dead[:8]), flush=True)
+        live = {c["udid"] for c in comps if c["pid"] not in set(killed)}
+        removed = 0
+        try:
+            names = os.listdir(IDB_SOCK_DIR)
+        except OSError:
+            names = []
+        now = time.time()
+        for n in stale_companion_sockets(names, {u.upper() for u in inv}, live):
+            path = os.path.join(IDB_SOCK_DIR, n)
+            try:
+                if now - os.lstat(path).st_mtime >= COMPANION_GRACE_S:
+                    os.unlink(path)
+                    removed += 1
+            except OSError:
+                pass
+        if removed:
+            print(f"idb sockets removed (device gone): {removed}", flush=True)
+        self._companions = {"at": now, "running": len(comps), "ended": len(killed),
+                            "socketsRemoved": removed}
 
     def doctor(self, fix=False):
         """Report (and with fix=True, evict) everything the sweep can see —
@@ -1825,6 +1916,10 @@ def main():
             print(f"simulators: {idle['booted']} booted, {idle['unleased']} with no lease"
                   + (f"; shut down idle: " + ", ".join(f"{x['name'] or x['udid'][:8]} ({x['upH']}h)" for x in idle["shutDown"][:5])
                      if idle.get("shutDown") else ""))
+        comp = st.get("companions")
+        if comp and (comp.get("ended") or comp.get("socketsRemoved")):
+            print(f"idb companions: {comp['running']} running; last sweep ended {comp['ended']}"
+                  f" and removed {comp['socketsRemoved']} socket(s) for gone devices")
         if not leases:
             print("nothing out.")
             return

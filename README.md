@@ -174,3 +174,28 @@ its ten cores with no app installed. Leases stopped only what they created.
 `status` reports what the sweep last saw and did: `idleSims {booted, unleased,
 shutDown[]}`. The CLI prints a `simulators:` line. Tested by
 `python3 test/idle_sims.py`.
+
+## An idb companion whose simulator is gone is ended (0.14.0)
+
+idb starts one `idb_companion --udid <UDID>` per simulator it drives, with a
+socket at `/tmp/idb/<UDID>_companion.sock`. A lease deletes its simulator, but
+nothing ended that simulator's companion. On 2026-10-20 the Mac Studio had 19
+companions running for devices that no longer existed, some from Oct 19, and
+109 stale sockets. (A wedged companion also cost a walk2gether run a phone the
+same day; the driver now restarts one that refuses, simon-says #1782.)
+
+The world sweep now ends a companion that meets both conditions:
+
+- **its UDID is not in `simctl list`**, read again just before ending it;
+- **it is older than 10 minutes**, so a device created after the inventory
+  read keeps its companion.
+
+It also removes a socket for a gone device when no companion holds it and the
+file is older than 10 minutes. Nothing else in the directory is touched
+(`FBPORTS_IDB_DIR`, default `/tmp/idb`). When `simctl list` fails or comes back
+empty, the sweep skips this step: an unreadable inventory never counts as
+"every device is gone".
+
+`status` reports `companions {running, ended, socketsRemoved}`, and the CLI
+prints an `idb companions:` line when the last sweep ended or removed anything.
+Tested by `python3 test/companions.py`.

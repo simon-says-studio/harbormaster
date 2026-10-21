@@ -84,7 +84,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.14.1"
+VERSION = "0.14.2"
 
 # Overridable for tests / parallel installs; default is the shared user daemon.
 # The dir keeps the old "firebase-ports" name: pre-rename binaries still installed
@@ -359,6 +359,20 @@ def _block_ports(base):
 
 def _service_ports(ports):
     return {s: p for s, p in ports.items() if s not in ("ui", "hub", "logging")}
+
+
+# A value that names a LEASED port: `{port:firestore}` becomes this lease's
+# firestore port. The caller cannot know its ports before the lease, and an
+# app whose functions read their own variable for the emulator (Tapuat's
+# admin.ts: `127.0.0.1:${EMULATOR_PORT_FIRESTORE || "8080"}`, unconditionally)
+# otherwise talks to whatever holds the default — on simon-linux-1, nothing;
+# every callable 500'd (run 20261021-131438-exploration-everyday-user). An
+# unknown service is left as written, so a typo shows in the app's own error.
+_PORT_REF = re.compile(r"\{port:([a-z_]+)\}")
+
+def _with_ports(env, ports):
+    return {k: _PORT_REF.sub(lambda m: str(ports[m.group(1)]) if m.group(1) in ports else m.group(0), v)
+            for k, v in env.items()}
 
 
 def _write_injected_config(cwd, ports, only=None):
@@ -814,9 +828,9 @@ class Broker:
         # daemon's env — the functions emulator runtime inherits it, which is
         # the only way a CALLER can set per-suite env (e.g. LLM_CACHE_DIR)
         # when the daemon, not the caller, spawns the emulator.
-        spawn_env = {**os.environ, **project_env(cwd), "TMPDIR": str(suite_tmp)}
+        spawn_env = {**os.environ, **_with_ports(project_env(cwd), all_ports), "TMPDIR": str(suite_tmp)}
         if extra_env:
-            spawn_env.update({str(k): str(v) for k, v in dict(extra_env).items()})
+            spawn_env.update(_with_ports({str(k): str(v) for k, v in dict(extra_env).items()}, all_ports))
         with open(log, "w") as lf:
             proc = subprocess.Popen(cmd, cwd=cwd, stdout=lf, stderr=subprocess.STDOUT, start_new_session=True, env=spawn_env)
         if on_spawn:
@@ -1860,7 +1874,7 @@ def main():
             # The project's env beats the caller's AMBIENT env here: a key
             # exported in some shell for a one-off script is exactly what
             # harbormaster.env exists to keep out of the suite (project_env).
-            rc = subprocess.call(run, cwd=cwd, env={**os.environ, **project_env(cwd)})
+            rc = subprocess.call(run, cwd=cwd, env={**os.environ, **_with_ports(project_env(cwd), _block_ports(base))})
         finally:
             try:
                 _call("POST", "/release", {"leaseId": lid})

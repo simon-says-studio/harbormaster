@@ -155,6 +155,15 @@ env, under the caller's explicit `--fn-env`. `exec`: on top of the caller's
 ambient env, so a key exported in some shell can't leak into the suite.
 `python3 test/project_env.py`.
 
+## A function env value can name a leased port (0.14.2)
+
+`--fn-env KEY={port:firestore}`, or the same in `harbormaster.env`, becomes
+this lease's firestore port, inside a value too (`127.0.0.1:{port:auth}`). A
+caller can't know its ports before the lease, and an app whose functions read
+their own variable for the emulator (Tapuat's `EMULATOR_PORT_FIRESTORE ||
+"8080"`) otherwise talks to whatever holds the default. An unknown service is
+left as written. `python3 test/port_env.py`.
+
 ## A lease never reads the hosting config it doesn't start (0.14.1)
 
 A lease whose `--only` leaves hosting out boots from a config with no

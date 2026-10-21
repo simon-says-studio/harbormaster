@@ -43,7 +43,7 @@ jobs:
             echo "::error::package.json says ${ver}, harbormaster's VERSION says ${script}: bump them together"; exit 1
           fi
           if npm view "${name}@${ver}" version >/dev/null 2>&1; then echo "${name}@${ver} is already on npm"; exit 0; fi
-          for t in test/managed.py test/idle_sims.py test/companions.py test/project_env.py test/scrub_env.py test/docker_ports.py; do
+          for t in test/injected_config.py test/android_ports.py test/managed.py test/idle_sims.py test/companions.py test/project_env.py test/scrub_env.py test/docker_ports.py; do
             python3 "${t}"
           done
           npm publish --access public

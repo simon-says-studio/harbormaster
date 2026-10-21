@@ -8,7 +8,7 @@ per-project instances — two callers that both want "an impulse emulator" get t
 independent suites, so they never collide on ports or data.
 
   acquire [--cwd DIR] [--owner PID] [--only a,b] [--ttl N] [--metro] [--sim]
-          [--fn-env KEY=VAL ...] [--json|--env]
+          [--android] [--fn-env KEY=VAL ...] [--json|--env]
         Boot a private sandbox for the project in DIR (default: nearest firebase.json
         above $PWD). Owned by --owner (default: the calling process's parent), reaped
         when that process exits. Prints the ports (use --env to eval into your shell).
@@ -20,15 +20,23 @@ independent suites, so they never collide on ports or data.
         Tune with --sim-device / --sim-runtime
         (or FBPORTS_SIM_DEVICE / FBPORTS_SIM_RUNTIME). This is the e2e dev-env: one
         lease = emulators + metro port + simulator, all torn down when the owner exits.
+        --android also leases an Android emulator console/adb port pair (an even
+        console port in 5554..5584, adb = console + 1; FBPORTS_ANDROID_CONSOLE_FIRST
+        / _LAST move the range): ANDROID_CONSOLE_PORT, ANDROID_ADB_PORT,
+        ANDROID_SERIAL=emulator-<console>. Boot with `emulator -port "$ANDROID_CONSOLE_PORT"`.
+        Every port the suite binds is on the block, including the ones firebase-tools
+        starts unasked (ui, logging, eventarc, tasks, firestore's websocket,
+        dataconnect's postgres); block offsets 12-14 are never bound — they're yours.
   up ...                 Alias for acquire (interactive dev; owner = your shell).
   down [--cwd DIR]       Release this shell's sandbox for DIR (else it's reaped on exit).
   release <leaseId>      Release a specific lease.
   status                 Everything the daemon has out.
-  allocate [--owner PID|auto] [--ttl N] [--metro] [--sim] [--spawn CMD] [--cwd DIR]
-           [--detach] [--json|--env]
+  allocate [--owner PID|auto] [--ttl N] [--metro] [--sim] [--android] [--spawn CMD]
+           [--cwd DIR] [--detach] [--json|--env]
         Reserve a block WITHOUT booting — for a caller that boots its own suite (the
         agent-qa run driver). Also owner-reaped. --metro/--sim work as on acquire
-        (metro port in the block; private simulator, deleted on reap) for e2e Metro
+        (metro port in the block; private simulator, deleted on reap), and so does
+        --android (the pair; CMD sees ANDROID_CONSOLE_PORT etc.), for e2e Metro
         sessions whose emulators are per-RUN acquires. NOTE: reserved leases also
         reap on TTL even with a live owner — pass a long --ttl for long-lived
         Metro sessions (owner death still reaps promptly).
@@ -36,7 +44,8 @@ independent suites, so they never collide on ports or data.
         lease's process: daemon-owned, so it survives the calling shell/agent —
         liveness is the spawned pid (+ TTL backstop), teardown kills its process
         group, stdout goes to the lease log. CMD sees FBPORTS_BLOCK_BASE,
-        FBPORTS_LEASE_ID, and METRO_PORT / DETOX_UDID / DETOX_SIM_NAME when leased.
+        FBPORTS_LEASE_ID, and METRO_PORT / DETOX_UDID / DETOX_SIM_NAME /
+        ANDROID_CONSOLE_PORT / ANDROID_ADB_PORT / ANDROID_SERIAL when leased.
         With --spawn (or --detach) the lease defaults to NO owner pid, since the
         calling shell exits immediately and would reap it. Pass --owner auto to
         record the nearest ancestor that DOES outlive the call (under an agent,
@@ -84,7 +93,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.14.2"
+VERSION = "0.15.0"
 
 # Overridable for tests / parallel installs; default is the shared user daemon.
 # The dir keeps the old "firebase-ports" name: pre-rename binaries still installed
@@ -103,14 +112,62 @@ BROKER_HOST, BROKER_PORT = "127.0.0.1", int(os.environ.get("FBPORTS_PORT", "4999
 POOL_BASE = int(os.environ.get("FBPORTS_POOL_BASE", "11000"))
 POOL_BLOCKS = int(os.environ.get("FBPORTS_POOL_BLOCKS", "200"))
 BLOCK = 20
+# EVERY port an emulator suite can bind is on its block (0.15.0). firebase-tools
+# (15.28, controller.js) binds more than firebase.json declares, and for any
+# port it is not given it takes the default and, if that is held, probes upward
+# — check-then-bind, so two suites booting in the same seconds pick the same
+# port and the second dies with "An unexpected error has occurred." (SSB's Mac
+# Studio, 2026-10-21: three suites, logging 4501/4502 twice; a walk2gether-expo
+# CI suite holding tasks 9501). Started unasked: hub (always), ui (whenever a
+# UI-supported emulator runs, declared or not), logging (with the ui), eventarc
+# and tasks (whenever functions has a backend — an extension counts), firestore's
+# websocket (9150), dataconnect's postgres (5432).
+#
+#   +0 auth        +5 hub        +10 firestore websocket  +15 hosting
+#   +1 firestore   +6 logging    +11 Metro (METRO_OFFSET) +16 apphosting
+#   +2 functions   +7 pubsub     +12 ┐                    +17 dataconnect
+#   +3 storage     +8 eventarc   +13 ├ the caller's       +18 dataconnect postgres
+#   +4 ui          +9 database   +14 ┘                    +19 tasks
+#
+# 12-14 stay the caller's: SimonSays' acquire callers put their verify dev
+# server / CDP / api / vite there (simon-says bin/lease-offsets.test.mjs,
+# web/playwright.config.ts, bin/seeded-explore). Everything else in the block
+# is harbormaster's. A reserved (`allocate`) block is the caller's whole, bar
+# Metro: this table is only what an `acquire`/`exec` suite binds.
 BLOCK_OFFSETS = {"auth": 0, "firestore": 1, "functions": 2, "storage": 3, "ui": 4,
                  "hub": 5, "logging": 6, "pubsub": 7, "eventarc": 8, "database": 9,
                  # Firestore's UI websocket is a SECOND port it needs (CLI default 9150).
                  # It must be pool-allocated too — otherwise every concurrent firestore
                  # emulator defaults to 9150 and they fight over it, even though their
                  # data ports are isolated. (Block is 20 wide, so +10 is in range.)
-                 "firestore_websocket": 10}
-METRO_OFFSET = 11        # Metro/Expo dev-server port in the block (offsets 0-10 are emulators)
+                 "firestore_websocket": 10,
+                 "hosting": 15, "apphosting": 16, "dataconnect": 17,
+                 # dataconnect's second port: its PGlite postgres (CLI default 5432).
+                 "dataconnect_postgres": 18,
+                 "tasks": 19}
+METRO_OFFSET = 11        # Metro/Expo dev-server port in the block
+CALLER_OFFSETS = (12, 13, 14)   # never bound by a suite; the acquire caller's own
+# What firebase-tools starts for a product named at the top level of
+# firebase.json OR under `emulators` (its filterEmulatorTargets), and what it
+# starts whether or not the file names it. eventarc/tasks are service emulators
+# to the CLI too, but bound only for a functions backend — so they're implicit.
+SERVICE_EMULATORS = ("auth", "firestore", "functions", "storage", "pubsub",
+                     "database", "hosting", "apphosting", "dataconnect")
+IMPLICIT_EMULATORS = ("hub", "ui", "logging", "eventarc", "tasks")
+# The second port an emulator binds: (emulator, its config key) -> offset name.
+SECOND_PORTS = {("firestore", "websocketPort"): "firestore_websocket",
+                ("dataconnect", "postgresPort"): "dataconnect_postgres"}
+# Keys under `emulators` that are settings, not emulators with a port of their
+# own (`extensions` runs inside the functions emulator).
+NOT_EMULATORS = ("singleProjectMode", "extensions")
+# Android emulator console ports (2026-10-21). An emulator instance binds an
+# even console port and adb = console + 1; adb discovers emulators only on
+# 5554..5584 (sixteen instances) unless ADB_LOCAL_TRANSPORT_MAX_PORT is raised,
+# and the emulator accepts -port up to 5682. A lease taken with --android gets
+# one pair from this range, leased like a block: unique among live leases,
+# both ports free when handed out, released with the lease.
+ANDROID_CONSOLE_FIRST = int(os.environ.get("FBPORTS_ANDROID_CONSOLE_FIRST", "5554"))
+ANDROID_CONSOLE_LAST = int(os.environ.get("FBPORTS_ANDROID_CONSOLE_LAST", "5584"))
 DEFAULT_SIM_DEVICE = os.environ.get("FBPORTS_SIM_DEVICE", "iPhone 16")
 DEFAULT_SIM_RUNTIME = os.environ.get("FBPORTS_SIM_RUNTIME",
                                      "com.apple.CoreSimulator.SimRuntime.iOS-18-2")
@@ -358,7 +415,8 @@ def _block_ports(base):
 
 
 def _service_ports(ports):
-    return {s: p for s, p in ports.items() if s not in ("ui", "hub", "logging")}
+    return {s: p for s, p in ports.items()
+            if s not in IMPLICIT_EMULATORS and s not in ("metro", "android_console", "android_adb")}
 
 
 # A value that names a LEASED port: `{port:firestore}` becomes this lease's
@@ -370,14 +428,35 @@ def _service_ports(ports):
 # unknown service is left as written, so a typo shows in the app's own error.
 _PORT_REF = re.compile(r"\{port:([a-z_]+)\}")
 
+def _android_env(ports):
+    """What a caller (and a --spawn'd process) is told about a leased Android
+    pair: boot with `emulator -port $ANDROID_CONSOLE_PORT`, talk to it as
+    $ANDROID_SERIAL (adb's name for the instance; adb itself honours it)."""
+    c = ports["android_console"]
+    return {"ANDROID_CONSOLE_PORT": str(c), "ANDROID_ADB_PORT": str(ports["android_adb"]),
+            "ANDROID_SERIAL": f"emulator-{c}"}
+
+
 def _with_ports(env, ports):
     return {k: _PORT_REF.sub(lambda m: str(ports[m.group(1)]) if m.group(1) in ports else m.group(0), v)
             for k, v in env.items()}
 
 
+def _emulator_targets(cfg):
+    """The service emulators firebase-tools would start for this config with no
+    --only: a product named at the top level or under `emulators`."""
+    emu = cfg.get("emulators") or {}
+    return [s for s in SERVICE_EMULATORS if s in cfg or s in emu]
+
+
 def _write_injected_config(cwd, ports, only=None):
-    """Set ports on the emulators the portless firebase.json DECLARES (+ hub/logging).
-    Never adds emulators the project doesn't use. Returns the temp config basename.
+    """Put EVERY port the CLI may bind for this config on the block: each
+    emulator the config starts (a product at the top level or under
+    `emulators`), the ones the CLI starts unasked (IMPLICIT_EMULATORS), and the
+    second ports (SECOND_PORTS). Never adds a service emulator the project
+    doesn't use — an `emulators.<x>` entry makes the CLI start <x>. A declared
+    emulator with no offset is refused by name (ValueError): no lease, no port.
+    Returns the temp config basename.
 
     With an --only that leaves hosting out, the `hosting` block goes too: no
     emulator a lease starts serves it, and firebase-tools still READS it. A
@@ -390,17 +469,23 @@ def _write_injected_config(cwd, ports, only=None):
     if only and "hosting" not in only:
         cfg.pop("hosting", None)
         emu.pop("hosting", None)
-    for svc in [k for k in emu if k != "singleProjectMode"]:
-        if svc in ports and isinstance(emu[svc], dict):
-            emu[svc]["port"] = ports[svc]
-            if svc == "ui":
-                emu[svc]["enabled"] = True
-            if svc == "firestore":
-                # Give firestore's UI websocket a private port too, else concurrent
-                # suites all default to 9150 and collide (isolated data port isn't enough).
-                emu[svc]["websocketPort"] = ports["firestore_websocket"]
-    for svc in ("hub", "logging"):
-        emu.setdefault(svc, {})["port"] = ports[svc]
+    known = set(SERVICE_EMULATORS) | set(IMPLICIT_EMULATORS) | set(NOT_EMULATORS)
+    unknown = [k for k, v in emu.items() if k not in known and isinstance(v, dict)
+               and (not only or k in only)]
+    if unknown:
+        raise ValueError(f"firebase.json declares emulator(s) harbormaster has no port for: "
+                         f"{', '.join(unknown)} — add them to BLOCK_OFFSETS")
+    if "ui" in emu and isinstance(emu["ui"], dict):
+        emu["ui"]["enabled"] = True        # declared: wanted on (as before 0.15.0)
+    for svc in [*_emulator_targets(cfg), *IMPLICIT_EMULATORS]:
+        if not isinstance(emu.get(svc), dict):
+            emu[svc] = {}
+        emu[svc]["port"] = ports[svc]
+    for (svc, key), name in SECOND_PORTS.items():
+        # Only on an emulator that starts: a key under emulators.<svc> would
+        # otherwise make the CLI start <svc>.
+        if svc in emu:
+            emu[svc][key] = ports[name]
     emu["singleProjectMode"] = True
     tmp = f".firebase.brokered-{ports['firestore']}.json"
     (Path(cwd) / tmp).write_text(json.dumps(cfg, indent=2))
@@ -797,6 +882,26 @@ class Broker:
                 return base
         raise RuntimeError("emulator port pool exhausted")
 
+    def _free_android_console(self):
+        """An even console port in ANDROID_CONSOLE_FIRST..LAST whose pair
+        (console, console + 1 = adb) no live lease holds and nothing listens
+        on. Called under self.lock, so two callers never draw one pair; the
+        listen check keeps a hand-booted emulator's pair out of it."""
+        used = {l["ports"].get("android_console") for l in self.leases.values()
+                if isinstance(l.get("ports"), dict)}
+        first = ANDROID_CONSOLE_FIRST + (ANDROID_CONSOLE_FIRST % 2)   # consoles are even
+        for console in range(first, ANDROID_CONSOLE_LAST + 1, 2):
+            if console in used:
+                continue
+            if not _port_open(console) and not _port_open(console + 1):
+                return console
+        raise RuntimeError(f"android console pool exhausted ({first}-{ANDROID_CONSOLE_LAST}: "
+                           f"every pair is leased or listening)")
+
+    def _lease_android(self, ports):
+        console = self._free_android_console()
+        ports["android_console"], ports["android_adb"] = console, console + 1
+
     def _boot(self, cwd, block, only, project_id, label, on_spawn=None, extra_env=None):
         all_ports = _block_ports(block)
         tmp = _write_injected_config(cwd, all_ports, only)
@@ -805,7 +910,12 @@ class Broker:
         # we'd wait forever for ports (functions, pubsub, …) that never open.
         declared = [k for k in json.loads((Path(cwd) / "firebase.json").read_text()).get("emulators", {}) if k != "singleProjectMode"]
         run_ports = {s: all_ports[s] for s in (only or declared) if s in all_ports}
-        check = {s: p for s, p in run_ports.items() if s not in ("ui", "hub", "logging")}
+        # Not waited on: the ones the CLI starts on its own terms (eventarc and
+        # tasks only for a functions backend), and hosting with no hosting
+        # config, which the CLI skips with a warning.
+        has_hosting = "hosting" in json.loads((Path(cwd) / tmp).read_text())
+        check = {s: p for s, p in run_ports.items()
+                 if s not in IMPLICIT_EMULATORS and (s != "hosting" or has_hosting)}
         log = STATE_DIR / f"{label}.log"
         # Each suite gets its OWN temp dir. firebase-tools keeps the Storage
         # emulator's blobs at `${os.tmpdir()}/firebase/storage/blobs` — one
@@ -934,7 +1044,9 @@ class Broker:
                 actions.append(f"tree sweep killed {sorted(killed)}")
         # Port sweep: every port the lease covers. rec["ports"] catches legacy
         # records; the block range catches everything else (metro, websocket).
-        ports = {v for v in (rec.get("ports") or {}).values() if isinstance(v, int)}
+        android = {v for k, v in (rec.get("ports") or {}).items()
+                   if k in ("android_console", "android_adb") and isinstance(v, int)}
+        ports = {v for v in (rec.get("ports") or {}).values() if isinstance(v, int)} - android
         if rec.get("block"):
             ports |= {rec["block"] + off for off in range(BLOCK)}
         if ports:
@@ -947,6 +1059,16 @@ class Broker:
                            if port in ports and pids)
             if still:
                 actions.append(f"ports STILL HELD after sweep: {still}")
+        # The Android pair is OUTSIDE the pool, where a hand-booted emulator
+        # lands by default (5554). So it is not port-swept: what the lease
+        # spawned died with its group and recorded tree above; anything still
+        # on the pair is reported, never signalled (the world sweep evicts it
+        # only if it is provably ours).
+        if android:
+            held = {port: pids for port, pids in _listeners().items() if port in android and pids}
+            if held:
+                actions.append(f"android ports still held (not signalled): "
+                               + ", ".join(f"{p} by {sorted(v)}" for p, v in sorted(held.items())))
         tmp = rec.get("tmp_config")
         if tmp and rec.get("cwd") and (Path(rec["cwd"]) / tmp).exists():
             (Path(rec["cwd"]) / tmp).unlink()
@@ -963,11 +1085,15 @@ class Broker:
             print(f"teardown {lid}: " + "; ".join(actions), flush=True)
 
     def acquire(self, cwd, owner_pid, owner_start=None, only=None, ttl=DEFAULT_TTL,
-                metro=False, sim=False, sim_device=None, sim_runtime=None, env=None):
+                metro=False, sim=False, sim_device=None, sim_runtime=None, env=None,
+                android=False):
         with self.lock:
             base = self._free_block()
             lid = f"run:{uuid.uuid4().hex[:12]}"
             project_id = _firebaserc_project(cwd)
+            # Drawn before the boot, so an exhausted range costs no suite; the
+            # lock is held throughout, so nobody else can draw it meanwhile.
+            android_console = self._free_android_console() if android else None
 
             def on_spawn(spawn_pid, spawn_tmp, spawn_log):
                 # Provisional record, saved before the readiness wait: a daemon
@@ -998,6 +1124,8 @@ class Broker:
             # collision-free by construction and needs no health check.
             if metro or sim:
                 ports["metro"] = base + METRO_OFFSET
+            if android_console:
+                ports["android_console"], ports["android_adb"] = android_console, android_console + 1
             sim_udid = sim_name = None
             if sim:
                 sim_name = lid.replace(":", "-")
@@ -1025,7 +1153,7 @@ class Broker:
 
     def allocate(self, owner_pid, owner_start=None, ttl=DEFAULT_TTL, label=None,
                  metro=False, sim=False, sim_device=None, sim_runtime=None,
-                 spawn=None, spawn_cwd=None):
+                 spawn=None, spawn_cwd=None, android=False):
         with self.lock:
             base = self._free_block()
             lid = f"alloc:{uuid.uuid4().hex[:12]}"
@@ -1037,6 +1165,10 @@ class Broker:
             # owns just the port + sim.
             if metro or sim:
                 ports["metro"] = base + METRO_OFFSET
+            # --android: an emulator console/adb pair, outside the pool (adb
+            # only discovers 5554..5584) but leased the same way.
+            if android:
+                self._lease_android(ports)
             sim_udid = sim_name = None
             if sim:
                 sim_name = lid.replace(":", "-")
@@ -1054,6 +1186,8 @@ class Broker:
                        "FBPORTS_LEASE_ID": lid}
                 if ports.get("metro"):
                     env["METRO_PORT"] = str(ports["metro"])
+                if ports.get("android_console"):
+                    env.update(_android_env(ports))
                 if sim_udid:
                     env["DETOX_UDID"] = sim_udid
                     env["DETOX_SIM_NAME"] = sim_name
@@ -1069,8 +1203,9 @@ class Broker:
                     if sim_udid:
                         _sim_teardown(sim_udid)
                     raise
+            android_note = f" android {ports['android_console']}" if android else ""
             print(f"leased {lid} ({label or 'no label'}): base {base}"
-                  f"{f' sim {sim_name}' if sim_udid else ''}"
+                  f"{f' sim {sim_name}' if sim_udid else ''}{android_note}"
                   f"{f' spawned pid {pid}' if pid else ''}", flush=True)
             self.leases[lid] = {"leaseId": lid, "kind": "reserved", "cwd": spawn_cwd,
                                 "block": base, "ports": ports, "pid": pid,
@@ -1242,9 +1377,14 @@ class Broker:
         for l in self.leases.values():
             if l.get("block"):
                 leased_ports |= {l["block"] + off for off in range(BLOCK)}
+        for l in self.leases.values():
+            for k in ("android_console", "android_adb"):
+                if isinstance((l.get("ports") or {}).get(k), int):
+                    leased_ports.add(l["ports"][k])
         pool_end = POOL_BASE + POOL_BLOCKS * BLOCK
         for port, pids in _listeners().items():
-            if POOL_BASE <= port < pool_end and port not in leased_ports:
+            in_android = ANDROID_CONSOLE_FIRST <= port <= ANDROID_CONSOLE_LAST + 1
+            if (POOL_BASE <= port < pool_end or in_android) and port not in leased_ports:
                 for pid in pids:
                     if pid not in lease_pids:
                         cmd = _proc_field(pid, "command=")[:200]
@@ -1428,13 +1568,14 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                                                  d.get("only"), d.get("ttl", DEFAULT_TTL),
                                                  d.get("metro", False), d.get("sim", False),
                                                  d.get("sim_device"), d.get("sim_runtime"),
-                                                 d.get("env")))
+                                                 d.get("env"), d.get("android", False)))
             if self.path == "/allocate":
                 return self._send(200, b.allocate(d.get("owner_pid"), d.get("owner_start"),
                                                   d.get("ttl", DEFAULT_TTL), d.get("label"),
                                                   d.get("metro", False), d.get("sim", False),
                                                   d.get("sim_device"), d.get("sim_runtime"),
-                                                  d.get("spawn"), d.get("spawn_cwd")))
+                                                  d.get("spawn"), d.get("spawn_cwd"),
+                                                  d.get("android", False)))
             if self.path == "/release":
                 return self._send(200, b.release(d.get("leaseId")))
             if self.path == "/release-owned":
@@ -1726,9 +1867,14 @@ def _print(out, fmt):
             if svc == "metro":
                 print(f"export METRO_PORT={port}")            # Expo/Metro dev server + Detox bundle URL
                 continue
+            if svc in ("android_console", "android_adb"):
+                continue                                      # below, as ANDROID_*
             if svc in std:
                 print(f"export {std[svc]}=127.0.0.1:{port}")
             print(f"export EMULATOR_{svc.upper()}_PORT={port}")
+        if ports.get("android_console"):
+            for k, v in _android_env(ports).items():
+                print(f"export {k}={v}")
         if sim:
             print(f"export DETOX_UDID={sim['udid']}")          # Detox targets this simulator by UDID
             print(f"export DETOX_SIM_NAME={sim['name']}")
@@ -1800,7 +1946,8 @@ def main():
                                              "metro": "metro" in flags, "sim": "sim" in flags,
                                              "sim_device": opts.get("sim-device"),
                                              "sim_runtime": opts.get("sim-runtime"),
-                                             "env": dict(kv.split("=", 1) for kv in opts.get("fn-env", []))}), "acquire"), fmt)
+                                             "env": dict(kv.split("=", 1) for kv in opts.get("fn-env", [])),
+                                             "android": "android" in flags}), "acquire"), fmt)
     elif cmd == "down":
         if _up():
             out = _call("POST", "/release-owned", {"owner_pid": os.getppid(), "cwd": _resolve_cwd(opts)})[1]
@@ -1829,7 +1976,8 @@ def main():
                                              "sim_device": opts.get("sim-device"),
                                              "sim_runtime": opts.get("sim-runtime"),
                                              "spawn": spawn,
-                                             "spawn_cwd": str(Path(opts["cwd"]).resolve()) if opts.get("cwd") else None}),
+                                             "spawn_cwd": str(Path(opts["cwd"]).resolve()) if opts.get("cwd") else None,
+                                             "android": "android" in flags}),
                  "allocate")
         if fmt == "env":
             # Reserved block, nothing booted — emit only the dev-env extras (plus
@@ -1838,6 +1986,9 @@ def main():
             print(f"export FBPORTS_LEASE_ID={out['leaseId']}")
             if out.get("ports", {}).get("metro"):
                 print(f"export METRO_PORT={out['ports']['metro']}")
+            if out.get("ports", {}).get("android_console"):
+                for k, v in _android_env(out["ports"]).items():
+                    print(f"export {k}={v}")
             if out.get("sim"):
                 print(f"export DETOX_UDID={out['sim']['udid']}")
                 print(f"export DETOX_SIM_NAME={out['sim']['name']}")
@@ -1848,6 +1999,8 @@ def main():
         else:
             extra = f"  metro {out['ports']['metro']}" if out.get("ports", {}).get("metro") else ""
             extra += f"  sim {out['sim']['udid']}" if out.get("sim") else ""
+            extra += (f"  android {out['ports']['android_console']}/{out['ports']['android_adb']}"
+                      if out.get("ports", {}).get("android_console") else "")
             extra += f"  spawned pid {out['spawnedPid']}" if out.get("spawnedPid") else ""
             print(f"{out['leaseId']}  base {out['base']}{extra}")
     elif cmd == "exec":
@@ -1865,7 +2018,12 @@ def main():
         me = os.getpid()                      # this process owns the reservation for the run
         res = ok(_call("POST", "/allocate", {"owner_pid": me, "owner_start": _proc_start(me), "label": "exec"}), "exec")
         base, lid = res["base"], res["leaseId"]
-        tmp = _write_injected_config(cwd, _block_ports(base), only)
+        try:
+            tmp = _write_injected_config(cwd, _block_ports(base), only)
+        except ValueError as e:
+            _call("POST", "/release", {"leaseId": lid})
+            print(f"exec failed: {e}", file=sys.stderr)
+            sys.exit(1)
         try:
             run = ["firebase", "emulators:exec", "--config", tmp]
             if only:
@@ -1955,6 +2113,8 @@ def main():
                 where += f" metro:{l['ports']['metro']}"
             if l.get("sim"):
                 where += f" sim:{l['sim'][:8]}"
+            if l["ports"].get("android_console"):
+                where += f" android:{l['ports']['android_console']}"
             print(f"{l['leaseId']:<22} {l['kind']:<9} owner:{str(l.get('ownerPid') or '-'):<7} "
                   f"{'up' if l['up'] else '-':<3} {where}{ttl}  "
                   f"{l.get('label') or ''}  {l.get('cwd') or ''}".rstrip())

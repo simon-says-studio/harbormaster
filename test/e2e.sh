@@ -154,6 +154,28 @@ check "lease reaped after parent SIGKILL" python3 -c "import json,sys; sys.exit(
 check "orphaned java killed by port sweep" not kill -0 "$JAVA2"
 check "port freed after crash reap" bash -c "! lsof -ti tcp:$FSPORT2 -sTCP:LISTEN | grep -q ."
 
+# --- 0.15.0: every port the suite binds is on its block -----------------------
+# functions in --only makes firebase-tools start eventarc and tasks; the ui
+# brings logging. None of them may land on a CLI default (4000/4400/4500/9150/
+# 9299/9499 + probe) — the 2026-10-21 Studio race. The Firestore JVM's own
+# listen(0) ports are kernel-assigned ephemerals (>= 49152) and cannot race.
+eval "$("$HM" acquire --cwd "${FBPORTS_TEST_PROJECT:-$HOME/impulse/impulse-functions}" --only auth,firestore,functions --owner $OWNER --env 2>/dev/null)"
+sleep 5                              # >= 2 reaper ticks: the tree is recorded
+BASE3=$(python3 -c "import json; print(list(json.load(open('$FBPORTS_STATE_DIR/ledger.json'))['leases'].values())[0]['block'])")
+PIDS3=$(python3 -c "
+import json; l = list(json.load(open('$FBPORTS_STATE_DIR/ledger.json'))['leases'].values())[0]
+print(','.join(sorted({str(l['pid']), *l.get('tree', {})})))")
+LPORTS3=$(lsof -nP -a -p "$PIDS3" -iTCP -sTCP:LISTEN -Fn 2>/dev/null | sed -n 's/^n.*:\([0-9]*\)$/\1/p' | sort -un | tr '\n' ' ')
+echo "suite listeners (block $BASE3): $LPORTS3"
+check "tasks is on the block (+19)" bash -c "lsof -ti tcp:$((BASE3 + 19)) -sTCP:LISTEN | grep -q ."
+check "eventarc is on the block (+8)" bash -c "lsof -ti tcp:$((BASE3 + 8)) -sTCP:LISTEN | grep -q ."
+check "every suite listener is on its block or kernel-ephemeral" python3 -c "
+import sys; b = $BASE3; ports = [int(p) for p in '$LPORTS3'.split()]
+off = [p for p in ports if not (b <= p < b + 20 or p >= 49152)]
+print('off-block:', off); sys.exit(1 if off or not ports else 0)"
+check "nothing on the caller's offsets (+12..+14)" bash -c "! lsof -ti tcp:$((BASE3 + 12)),$((BASE3 + 13)),$((BASE3 + 14)) -sTCP:LISTEN | grep -q ."
+"$HM" release "$FBPORTS_LEASE_ID" >/dev/null 2>&1
+
 kill "$OWNER" 2>/dev/null
 curl -s -X POST localhost:5999/shutdown >/dev/null 2>&1
 sleep 1; kill "$DPID" 2>/dev/null

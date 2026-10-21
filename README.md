@@ -155,6 +155,16 @@ env, under the caller's explicit `--fn-env`. `exec`: on top of the caller's
 ambient env, so a key exported in some shell can't leak into the suite.
 `python3 test/project_env.py`.
 
+## A lease never reads the hosting config it doesn't start (0.14.1)
+
+A lease whose `--only` leaves hosting out boots from a config with no
+`hosting` block. firebase-tools 15.33 reads `hosting` even when it starts no
+hosting emulator, and a web-framework target (`"source": "."`, Next.js)
+makes it refuse every emulator without the `webframeworks` experiment.
+Tapuat's lease on simon-linux-1 died there on 2026-10-21; 15.28 on the
+studio never checked. An `--only` that asks for hosting, or no `--only`,
+keeps it. `python3 test/injected_config.py`.
+
 ## An idle simulator nobody leases is shut down (0.13.0)
 
 The world sweep (every `FBPORTS_SWEEP_INTERVAL`, 5 min) now shuts down a

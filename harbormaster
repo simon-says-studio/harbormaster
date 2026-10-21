@@ -84,7 +84,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.14.0"
+VERSION = "0.14.1"
 
 # Overridable for tests / parallel installs; default is the shared user daemon.
 # The dir keeps the old "firebase-ports" name: pre-rename binaries still installed
@@ -361,11 +361,21 @@ def _service_ports(ports):
     return {s: p for s, p in ports.items() if s not in ("ui", "hub", "logging")}
 
 
-def _write_injected_config(cwd, ports):
+def _write_injected_config(cwd, ports, only=None):
     """Set ports on the emulators the portless firebase.json DECLARES (+ hub/logging).
-    Never adds emulators the project doesn't use. Returns the temp config basename."""
+    Never adds emulators the project doesn't use. Returns the temp config basename.
+
+    With an --only that leaves hosting out, the `hosting` block goes too: no
+    emulator a lease starts serves it, and firebase-tools still READS it. A
+    web-framework target (`"source": "."`, a Next.js app) makes 15.33 refuse to
+    start ANY emulator without the webframeworks experiment — Tapuat's run
+    20261021-130009-exploration-everyday-user died there on simon-linux-1 while
+    15.28 on the studio never checked."""
     cfg = json.loads((Path(cwd) / "firebase.json").read_text())
     emu = cfg.setdefault("emulators", {})
+    if only and "hosting" not in only:
+        cfg.pop("hosting", None)
+        emu.pop("hosting", None)
     for svc in [k for k in emu if k != "singleProjectMode"]:
         if svc in ports and isinstance(emu[svc], dict):
             emu[svc]["port"] = ports[svc]
@@ -775,7 +785,7 @@ class Broker:
 
     def _boot(self, cwd, block, only, project_id, label, on_spawn=None, extra_env=None):
         all_ports = _block_ports(block)
-        tmp = _write_injected_config(cwd, all_ports)
+        tmp = _write_injected_config(cwd, all_ports, only)
         # Readiness/liveness track ONLY the data services actually started (respect
         # --only, else the project's declared emulators; skip ui/hub/logging) — else
         # we'd wait forever for ports (functions, pubsub, …) that never open.
@@ -1841,7 +1851,7 @@ def main():
         me = os.getpid()                      # this process owns the reservation for the run
         res = ok(_call("POST", "/allocate", {"owner_pid": me, "owner_start": _proc_start(me), "label": "exec"}), "exec")
         base, lid = res["base"], res["leaseId"]
-        tmp = _write_injected_config(cwd, _block_ports(base))
+        tmp = _write_injected_config(cwd, _block_ports(base), only)
         try:
             run = ["firebase", "emulators:exec", "--config", tmp]
             if only:

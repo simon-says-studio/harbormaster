@@ -92,8 +92,9 @@ its port) can never linger for callers to "reuse".
   children die too) when `owner_pid` dies. The caller's death *is* the release —
   nothing to remember, and never a reason to `pkill`. A TTL and emulator-liveness are
   backstops.
-- **Pool ports.** Blocks of 20 from 11000–14999; each firestore suite also gets a
-  private websocket port, so concurrent suites never collide on the default 9150.
+- **Pool ports.** Blocks of 20 from 11000–14999. Every port a suite binds is on its
+  block, including the ones firebase-tools starts unasked (see "Every port a suite
+  binds is on its block"); offsets 12–14 are left for the caller.
 - **No registry, no shared instances.** A "project" is just the `firebase.json` in
   `cwd`; the project id comes from `.firebaserc`.
 
@@ -163,6 +164,50 @@ caller can't know its ports before the lease, and an app whose functions read
 their own variable for the emulator (Tapuat's `EMULATOR_PORT_FIRESTORE ||
 "8080"`) otherwise talks to whatever holds the default. An unknown service is
 left as written. `python3 test/port_env.py`.
+
+## Every port a suite binds is on its block (0.15.0)
+
+firebase-tools starts more than `firebase.json` declares: the hub always; the
+UI whenever a UI-supported emulator runs (declared or not) and logging with
+it; eventarc and tasks whenever functions has a backend (an extension counts);
+firestore's websocket (9150) and dataconnect's postgres (5432). Any port it is
+not given it takes from the default and, if that is held, probes upward —
+check-then-bind, so two suites booting in the same seconds pick the same port
+and the second dies with "An unexpected error has occurred." (SimonSays' Mac
+Studio, 2026-10-21: logging 4501 and 4502 taken twice; a walk2gether-expo CI
+suite holding tasks 9501.) The injected config now sets all of them, plus
+hosting, apphosting and dataconnect wherever the project uses them:
+
+| +0 auth | +5 hub | +10 firestore websocket | +15 hosting |
+|---|---|---|---|
+| +1 firestore | +6 logging | +11 Metro | +16 apphosting |
+| +2 functions | +7 pubsub | +12 caller | +17 dataconnect |
+| +3 storage | +8 eventarc | +13 caller | +18 dataconnect postgres |
+| +4 ui | +9 database | +14 caller | +19 tasks |
+
++12..+14 are never bound by a suite. A declared emulator with no offset is
+refused by name instead of left to its default. Teardown and the world sweep
+already cover the whole block. `python3 test/injected_config.py`; `test/e2e.sh`
+checks a live suite's listeners.
+
+## An Android emulator's ports are a lease (0.15.0)
+
+`acquire --android` / `allocate --android` also lease an emulator console/adb
+pair: an even console port in 5554..5584 (the range adb discovers; adb =
+console + 1; `FBPORTS_ANDROID_CONSOLE_FIRST`/`_LAST` move it), unique among
+live leases and free when handed out. The caller (and a `--spawn` process)
+gets `ANDROID_CONSOLE_PORT`, `ANDROID_ADB_PORT`, `ANDROID_SERIAL=emulator-<console>`:
+
+```bash
+harbormaster allocate --android --owner auto \
+  --spawn 'exec emulator -avd Pixel -port "$ANDROID_CONSOLE_PORT" -read-only -no-window' --env
+```
+
+The pair is outside the pool, where a hand-booted emulator lands by default, so
+teardown kills only what the lease spawned (its group and recorded tree) and
+reports anything else still on the pair; the world sweep reports unleased
+listeners on the range and evicts only what it can attribute.
+`python3 test/android_ports.py`.
 
 ## A lease never reads the hosting config it doesn't start (0.14.1)
 

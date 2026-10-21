@@ -169,9 +169,20 @@ POST /doctor    {fix?}                                      -> {findings, fixed,
 ```
 
 CLI: `acquire` / `up` (alias) / `down` (release your lease) / `release <id>` / `status`
-/ `leases` / `allocate` / `serve`. Pool: blocks of 20 ports from 11000–14999, offsets
-`auth=+0 firestore=+1 functions=+2 storage=+3 ui=+4 hub=+5 logging=+6 pubsub=+7
-eventarc=+8 database=+9` (kept in sync with the run driver's derivation).
+/ `leases` / `allocate` / `serve`. Pool: blocks of 20 ports from 11000–14999. An
+`acquire`/`exec` suite's block (0.15.0: every port the CLI may bind, declared or not):
+
+| +0 auth | +5 hub | +10 firestore websocket | +15 hosting |
+|---|---|---|---|
+| +1 firestore | +6 logging | +11 Metro | +16 apphosting |
+| +2 functions | +7 pubsub | +12 caller | +17 dataconnect |
+| +3 storage | +8 eventarc | +13 caller | +18 dataconnect postgres |
+| +4 ui | +9 database | +14 caller | +19 tasks |
+
++12..+14 are never bound by a suite: they are the caller's (SimonSays' verify dev
+server, CDP, api, vite). A reserved (`allocate`) block is the caller's whole, bar
+Metro at +11. Android emulator console/adb pairs (`--android`) come from a second
+range, even consoles 5554–5584 (adb = console + 1), leased the same way.
 
 ## What changes from v1
 

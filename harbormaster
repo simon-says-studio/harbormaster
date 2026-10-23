@@ -93,7 +93,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.15.1"
+VERSION = "0.16.0"
 
 # Overridable for tests / parallel installs; default is the shared user daemon.
 # The dir keeps the old "firebase-ports" name: pre-rename binaries still installed
@@ -1256,6 +1256,24 @@ class Broker:
             self._save()
             return {"released": n}
 
+    def reown(self, lid, owner_pid, owner_start=None):
+        """Hand a lease to another owner. A daemon leases a run's block before it
+        spawns the run, so the daemon is the owner; a run that outlives its daemon
+        (adopted by the next one after a fleet restart) lost its block the moment
+        the old daemon exited, and the port sweep killed its emulators mid-scene
+        (simon-says run eTNE06AK34IJcoKGyj0k, 2026-10-22). The run takes its block
+        over at startup, so the block lives exactly as long as the run."""
+        with self.lock:
+            l = self.leases.get(lid)
+            if not l:
+                return {"ok": False, "reason": "no such lease"}
+            if owner_pid is None or not _pid_alive(int(owner_pid)):
+                return {"ok": False, "reason": f"owner {owner_pid} is not alive"}
+            l["owner_pid"] = int(owner_pid)
+            l["owner_start"] = owner_start if owner_start is not None else _proc_start(int(owner_pid))
+            self._save()
+            return {"ok": True}
+
     def heartbeat(self, lid, ttl=DEFAULT_TTL):
         with self.lock:
             l = self.leases.get(lid)
@@ -1590,6 +1608,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 return self._send(200, b.release(d.get("leaseId")))
             if self.path == "/release-owned":
                 return self._send(200, b.release_owned(d.get("owner_pid"), d.get("cwd")))
+            if self.path == "/reown":
+                return self._send(200, b.reown(d.get("leaseId"), d.get("owner_pid"), d.get("owner_start")))
             if self.path == "/heartbeat":
                 return self._send(200, b.heartbeat(d.get("leaseId"), d.get("ttl", DEFAULT_TTL)))
             if self.path == "/verify":
@@ -1970,6 +1990,18 @@ def main():
             print("released" if out.get("released") else f"not released: {out.get('reason')}")
         else:
             print("nothing to release")
+    elif cmd == "reown":
+        # harbormaster reown <leaseId> [--owner PID]: the lease is now owned by
+        # PID (default: the caller's parent, as for allocate).
+        if not (_up() and pos):
+            print("usage: harbormaster reown <leaseId> [--owner PID]", file=sys.stderr)
+            sys.exit(1)
+        pid, start = _owner(opts)
+        out = _call("POST", "/reown", {"leaseId": pos[0], "owner_pid": pid, "owner_start": start})[1]
+        if not out.get("ok"):
+            print(f"not reowned: {out.get('reason')}", file=sys.stderr)
+            sys.exit(1)
+        print(f"reowned {pos[0]} to {pid}")
     elif cmd == "allocate":
         _ensure()
         spawn = opts.get("spawn")

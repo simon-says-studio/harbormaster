@@ -94,7 +94,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.17.0"
+VERSION = "0.17.1"
 
 # Overridable for tests / parallel installs; default is the shared user daemon.
 # The dir keeps the old "firebase-ports" name: pre-rename binaries still installed
@@ -521,7 +521,7 @@ def _authored_sims():
 
 def _authored_sims_write(udids):
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = SIMS_FILE.with_suffix(".tmp")
+    tmp = SIMS_FILE.with_suffix(f".tmp-{os.getpid()}-{threading.get_ident()}")   # see Broker._save
     tmp.write_text(json.dumps(sorted(udids)))
     tmp.replace(SIMS_FILE)
 
@@ -783,7 +783,11 @@ class Broker:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         # Atomic: a crash mid-write must never leave a half-written ledger
         # (see _load — a corrupt ledger orphans everything at once).
-        tmp = LEDGER.with_suffix(".tmp")
+        # Per process: two writers sharing one ledger.tmp interleave into a
+        # file json can't read ("Extra data"), and the loser's replace finds
+        # it gone. cmd_serve's bind-first means only one broker writes; this
+        # keeps any other writer from corrupting it.
+        tmp = LEDGER.with_suffix(f".tmp-{os.getpid()}-{threading.get_ident()}")
         tmp.write_text(json.dumps({"leases": self.leases, "draining": self.draining}, indent=2))
         tmp.replace(LEDGER)
 
@@ -1833,6 +1837,23 @@ def _touch_managed():
 
 def cmd_serve(managed=False):
     STATE_DIR.mkdir(parents=True, exist_ok=True)
+    # BIND FIRST. Broker() is not inert: it loads the ledger, reaps dead
+    # leases (deleting their sims), and saves. Until 0.17.1 it ran before the
+    # bind, so every client that raced to start a broker after a reboot did a
+    # whole reconcile and ledger write and only THEN died on "Address already
+    # in use" — beside the broker that won. On the studio (2026-10-23) the
+    # losers' writes corrupted the ledger, the winner quarantined it, and its
+    # world sweep deleted four sims that live runs had just leased. The port
+    # is the broker's mutex: only its holder may touch the ledger, the managed
+    # mark, or anything on the box. A request that arrives before Broker() is
+    # ready waits in the listen backlog — nothing is served until
+    # serve_forever.
+    try:
+        srv = http.server.ThreadingHTTPServer((BROKER_HOST, BROKER_PORT), _Handler)
+    except OSError as e:
+        print(f"harbormaster: {BROKER_HOST}:{BROKER_PORT} is taken ({e}) — another broker "
+              f"is serving; this one exits without touching the ledger", flush=True)
+        sys.exit(1)
     if managed:
         _touch_managed()
 
@@ -1845,7 +1866,6 @@ def cmd_serve(managed=False):
     if dropped:
         print(f"harbormaster: scrubbed inherited env before serving: {', '.join(dropped)}", flush=True)
     _Handler.broker = Broker()
-    srv = http.server.ThreadingHTTPServer((BROKER_HOST, BROKER_PORT), _Handler)
 
     def reaper():
         while True:

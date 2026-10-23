@@ -296,3 +296,16 @@ grant and tears down whatever it made, instead of reserving a block nobody
 will release. On 2026-10-22 the studio's allocates queued behind the reaper
 past the SSB daemon's 30s timeout, seven times, and each was granted anyway.
 Tested by `python3 test/teardown_lock.py`.
+
+## A broker that loses the port touches nothing (0.17.1)
+
+`serve` binds the port before it builds the broker. Building the broker loads
+the ledger, reaps dead leases (deleting their simulators) and saves, so until
+0.17.1 every client that raced to start one after a reboot did all of that,
+then died on "Address already in use" beside the broker that won. On the
+studio (2026-10-23) those losers' writes corrupted the ledger, the winner
+quarantined it, and its world sweep deleted four simulators that live runs had
+just leased. The port is now the broker's mutex: a loser exits before touching
+the ledger or the managed marker. The ledger and sims-registry temp files are
+per writer, so no two writers can interleave into one.
+`python3 test/serve_bind_first.py`.

@@ -263,3 +263,13 @@ empty, the sweep skips this step: an unreadable inventory never counts as
 `status` reports `companions {running, ended, socketsRemoved}`, and the CLI
 prints an `idb companions:` line when the last sweep ended or removed anything.
 Tested by `python3 test/companions.py`.
+
+## A live owner's block survives its suite restarting (0.15.1)
+
+A reserved block whose caller boots its own suite is reaped when its ports stay
+down — after 45s with no owner, but after `FBPORTS_OWNED_RECLAIM_GRACE` (900s)
+when its owner is alive. On 2026-10-22 a resumed story's suite was dark for over
+45s while it re-imported its checkpoint; the block was reaped under the live
+daemon that owned it, re-leased, and the next run's port sweep killed the
+story's emulators mid-scene. The owner's death still reaps at once. Tested by
+`python3 test/owned_grace.py`.

@@ -93,7 +93,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.15.0"
+VERSION = "0.15.1"
 
 # Overridable for tests / parallel installs; default is the shared user daemon.
 # The dir keeps the old "firebase-ports" name: pre-rename binaries still installed
@@ -173,6 +173,15 @@ DEFAULT_SIM_RUNTIME = os.environ.get("FBPORTS_SIM_RUNTIME",
                                      "com.apple.CoreSimulator.SimRuntime.iOS-18-2")
 DEFAULT_TTL = 3600
 RECLAIM_GRACE = int(os.environ.get("FBPORTS_RECLAIM_GRACE", "45"))
+# A reserved block whose OWNER is alive gets a much longer grace: its caller
+# boots and restarts its own suite, and a restart (a resumed story re-importing
+# its checkpoint, a Metro rebuild) can leave the block dark for minutes. At 45s
+# the block was reaped mid-run and re-leased; the next caller's port sweep then
+# killed the first run's live emulators (simon-says run fFKN8lt07cGocGVYx86V,
+# 2026-10-22: Firestore exit 143 in scene 6, the story finished against another
+# run's backend). The owner's death still reaps it at once; this only bounds
+# how long a long-lived owner (a daemon) keeps a block whose run has ended.
+OWNED_RECLAIM_GRACE = int(os.environ.get("FBPORTS_OWNED_RECLAIM_GRACE", "900"))
 REAP_INTERVAL = int(os.environ.get("FBPORTS_REAP_INTERVAL", "10"))
 # How often the reaper cross-checks leased simulators against simctl. A lease
 # whose sim was deleted externally is broken for its caller even if its process
@@ -842,7 +851,8 @@ class Broker:
                 l["seen_active"], l["down_since"] = True, None
             elif l.get("seen_active"):
                 l["down_since"] = l.get("down_since") or now
-            if l.get("down_since") and now - l["down_since"] >= RECLAIM_GRACE:
+            grace = OWNED_RECLAIM_GRACE if l.get("owner_pid") is not None else RECLAIM_GRACE
+            if l.get("down_since") and now - l["down_since"] >= grace:
                 return "reserved block down past grace"
             return None
         if l.get("state") == "booting":

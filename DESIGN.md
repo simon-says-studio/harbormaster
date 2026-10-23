@@ -97,7 +97,10 @@ A lease is reclaimed when ANY of:
 5. **Emulator liveness** — dead suite process → reaped immediately; ports down (with
    the process alive) only reap after a grace window of continuous downtime, for both
    daemon-booted suites and reserved (caller-booted) blocks. A single failed connect
-   check on a loaded machine must never kill a healthy suite.
+   check on a loaded machine must never kill a healthy suite. A reserved block whose
+   owner is alive waits `FBPORTS_OWNED_RECLAIM_GRACE` (900s) rather than 45s: its
+   caller restarts its own suite, and a 45s reap mid-restart handed a live run's
+   block to the next caller, whose port sweep killed it (2026-10-22).
 
 Teardown frees the lease's **resources**, not just the process the daemon spawned —
 because the spawned process's group is provably not enough. v2 shipped assuming

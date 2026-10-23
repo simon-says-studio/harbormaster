@@ -33,7 +33,7 @@ hm._port_open = lambda port, host="127.0.0.1": port in listening
 hm._docker_published_ports = lambda: set()
 
 b = hm.Broker.__new__(hm.Broker)
-b.lock, b.leases = hm.threading.RLock(), {}
+b.lock, b.leases, b.draining = hm.threading.RLock(), {}, {}
 
 check("the range is adb's: even consoles 5554..5584",
       (hm.ANDROID_CONSOLE_FIRST, hm.ANDROID_CONSOLE_LAST) == (5554, 5584))

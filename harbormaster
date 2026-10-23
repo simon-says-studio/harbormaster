@@ -83,6 +83,7 @@ import json
 import os
 import signal
 import re
+import select
 import socket
 import shutil
 import subprocess
@@ -93,7 +94,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.16.0"
+VERSION = "0.17.0"
 
 # Overridable for tests / parallel installs; default is the shared user daemon.
 # The dir keeps the old "firebase-ports" name: pre-rename binaries still installed
@@ -748,6 +749,12 @@ class Broker:
     def __init__(self):
         self.lock = threading.RLock()
         self.leases = {}                  # leaseId -> caller-owned lease
+        # Leases already reaped/released whose teardown is still running. The
+        # lock guards the LEDGER only; the slow part of a teardown (process
+        # group kills, simctl delete, rm -rf) runs outside it (0.17.0). Until
+        # it finishes the block stays out of the pool — the teardown's port
+        # sweep would kill whatever the next lease started on it.
+        self.draining = {}
         self._load()
         self._reconcile()
         # _reconcile just swept; without this the reaper's throttle (epoch 0)
@@ -758,7 +765,9 @@ class Broker:
     def _load(self):
         if LEDGER.exists():
             try:
-                self.leases = json.loads(LEDGER.read_text()).get("leases", {})
+                saved = json.loads(LEDGER.read_text())
+                self.leases = saved.get("leases", {})
+                self.draining = saved.get("draining", {})
             except (json.JSONDecodeError, OSError) as e:
                 # A silently-dropped ledger orphans every live suite/sim/port at
                 # once. Quarantine it loudly; the world sweep adopts the fallout.
@@ -775,10 +784,15 @@ class Broker:
         # Atomic: a crash mid-write must never leave a half-written ledger
         # (see _load — a corrupt ledger orphans everything at once).
         tmp = LEDGER.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"leases": self.leases}, indent=2))
+        tmp.write_text(json.dumps({"leases": self.leases, "draining": self.draining}, indent=2))
         tmp.replace(LEDGER)
 
     def _reconcile(self):
+        # A predecessor that died mid-teardown left its draining records in
+        # the ledger: finish them (single-threaded here, nothing to race).
+        for lid in list(self.draining):
+            print(f"finishing teardown {lid} (predecessor stopped mid-teardown)", flush=True)
+            self._cleanup(self.draining.pop(lid))
         for lid in list(self.leases):
             reason = self._dead_reason(self.leases[lid], time.time())
             if reason:
@@ -786,6 +800,63 @@ class Broker:
                 self._cleanup(self.leases.pop(lid))
         self._record_trees()
         self._save()
+
+    def _held(self):
+        """Every record whose resources are still out there: live leases and
+        the ones draining. Called under self.lock."""
+        return list(self.leases.values()) + list(self.draining.values())
+
+    def _retire(self, lid, why):
+        """Under self.lock: take a lease out of service — the ledger no longer
+        grants it — and park it in `draining` until _drain has torn it down.
+        Cheap by construction; nothing here may block."""
+        rec = self.leases.pop(lid, None)
+        if rec is None:
+            return None
+        print(f"{why}", flush=True)
+        self.draining[lid] = rec
+        return rec
+
+    def _drain(self, recs):
+        """OUTSIDE self.lock: the slow half of a teardown. An allocate that
+        arrives meanwhile is answered at once from the rest of the pool
+        (2026-10-22, the studio: allocates queued behind a reaper teardown
+        waited past the client's 30s, and were granted after it gave up)."""
+        for rec in recs:
+            if not rec:
+                continue
+            try:
+                self._cleanup(rec)
+            except Exception as e:
+                print(f"teardown {rec.get('leaseId') or '?'} failed: {e}", flush=True)
+            finally:
+                with self.lock:
+                    self.draining.pop(rec.get("leaseId"), None)
+                    self._save()
+
+    def _held_sets(self):
+        """Under self.lock: what the world sweep must leave alone — every pid,
+        port, simulator (by UDID or the name an in-flight create gives it) and
+        recorded tree member a held record covers."""
+        held = self._held()
+        pids = {int(l["pid"]) for l in held if l.get("pid")}
+        authored = {}
+        ports = set()
+        udids, names = set(), set()
+        for l in held:
+            for pid, start in (l.get("tree") or {}).items():
+                authored[int(pid)] = start
+            if l.get("block"):
+                ports |= {l["block"] + off for off in range(BLOCK)}
+            for k in ("android_console", "android_adb"):
+                if isinstance((l.get("ports") or {}).get(k), int):
+                    ports.add(l["ports"][k])
+            if l.get("sim_udid"):
+                udids.add(l["sim_udid"])
+            if l.get("sim_name"):
+                names.add(l["sim_name"])
+        return {"pids": pids, "authored": authored, "ports": ports,
+                "udids": udids, "names": names}
 
     def _record_trees(self):
         """Every tick, note which processes each live lease's root has fathered.
@@ -795,20 +866,21 @@ class Broker:
         accumulate across polls (a worker seen once is remembered after it
         detaches); a recycled pid — same number, different start — is dropped,
         never inherited."""
-        table = _ps_table()
+        table = _ps_table()                    # outside the lock: ps is slow on a busy box
         if not table:
             return
-        for rec in self.leases.values():
-            root = rec.get("pid")
-            if not root or root not in table:
-                continue
-            tree = rec.setdefault("tree", {})
-            for pid, start in _descendants(root, table).items():
-                tree[str(pid)] = start
-            for pid in list(tree):
-                live = table.get(int(pid))
-                if live and live[1] != tree[pid]:
-                    del tree[pid]              # recycled pid — a stranger now
+        with self.lock:
+            for rec in self.leases.values():
+                root = rec.get("pid")
+                if not root or root not in table:
+                    continue
+                tree = rec.setdefault("tree", {})
+                for pid, start in _descendants(root, table).items():
+                    tree[str(pid)] = start
+                for pid in list(tree):
+                    live = table.get(int(pid))
+                    if live and live[1] != tree[pid]:
+                        del tree[pid]          # recycled pid — a stranger now
         # Ledger-vs-world is only half the job: anything that escaped the
         # ledger (daemon crash mid-boot, corrupt ledger, detached children of
         # past suites) is invisible to the loop above and immortal without this.
@@ -858,7 +930,12 @@ class Broker:
         if l.get("state") == "booting":
             # Provisional record written at spawn time so a daemon crash can't
             # orphan a mid-boot suite. Ports aren't expected open yet — only a
-            # dead process or a blown boot window reaps it.
+            # dead process or a blown boot window reaps it. No pid yet = the
+            # block is drawn and the spawn is about to happen (outside the lock).
+            if not l.get("pid"):
+                if now - l.get("booting_since", now) > BOOT_BACKSTOP + 60:
+                    return "boot window exceeded"
+                return None
             if not _child_alive(l.get("pid")):
                 return f"suite pid {l.get('pid')} died during boot"
             if now - l.get("booting_since", now) > BOOT_BACKSTOP + 60:
@@ -880,7 +957,7 @@ class Broker:
         return None
 
     def _free_block(self):
-        used = {l["block"] for l in self.leases.values() if l.get("block")}
+        used = {l["block"] for l in self._held() if l.get("block")}
         published = _docker_published_ports()
         for i in range(POOL_BLOCKS):
             base = POOL_BASE + i * BLOCK
@@ -897,7 +974,7 @@ class Broker:
         (console, console + 1 = adb) no live lease holds and nothing listens
         on. Called under self.lock, so two callers never draw one pair; the
         listen check keeps a hand-booted emulator's pair out of it."""
-        used = {l["ports"].get("android_console") for l in self.leases.values()
+        used = {l["ports"].get("android_console") for l in self._held()
                 if isinstance(l.get("ports"), dict)}
         first = ANDROID_CONSOLE_FIRST + (ANDROID_CONSOLE_FIRST % 2)   # consoles are even
         for console in range(first, ANDROID_CONSOLE_LAST + 1, 2):
@@ -1094,79 +1171,126 @@ class Broker:
         if actions:
             print(f"teardown {lid}: " + "; ".join(actions), flush=True)
 
+    def _commit(self, lid, rec, client_gone, undo):
+        """Under self.lock: grant `lid` as `rec`, unless the lease was reaped
+        while its resources were made outside the lock (owner died mid-boot)
+        or the caller hung up waiting (its client-side timeout fired). A grant
+        nobody receives is a block reserved for its whole TTL with no one to
+        release it — the 2026-10-22 studio orphans. Either way `undo` (the
+        record to tear down) is retired and the caller raises."""
+        if lid not in self.leases:
+            self.draining[lid] = undo
+            return f"lease {lid} was reaped while it was being made"
+        if client_gone and client_gone():
+            self._retire(lid, f"not granting {lid}: the client gave up waiting")
+            self.draining[lid] = undo
+            return f"client gave up before {lid} was granted"
+        self.leases[lid] = rec
+        self._save()
+        return None
+
     def acquire(self, cwd, owner_pid, owner_start=None, only=None, ttl=DEFAULT_TTL,
                 metro=False, sim=False, sim_device=None, sim_runtime=None, env=None,
-                android=False):
+                android=False, client_gone=None):
+        # The lock covers DRAWING the block (and the Android pair) and writing
+        # the provisional record that holds them; the boot (up to
+        # BOOT_BACKSTOP) and the simulator happen outside it, so one suite's
+        # boot never queues every other caller.
+        lid = f"run:{uuid.uuid4().hex[:12]}"
+        project_id = _firebaserc_project(cwd)
         with self.lock:
             base = self._free_block()
-            lid = f"run:{uuid.uuid4().hex[:12]}"
-            project_id = _firebaserc_project(cwd)
-            # Drawn before the boot, so an exhausted range costs no suite; the
-            # lock is held throughout, so nobody else can draw it meanwhile.
+            # Drawn before the boot, so an exhausted range costs no suite.
             android_console = self._free_android_console() if android else None
-
-            def on_spawn(spawn_pid, spawn_tmp, spawn_log):
-                # Provisional record, saved before the readiness wait: a daemon
-                # crash mid-boot must leave a findable lease, not a ghost suite.
-                self.leases[lid] = {"leaseId": lid, "kind": "acquired",
-                                    "state": "booting", "booting_since": time.time(),
-                                    "cwd": cwd, "block": base, "ports": {},
-                                    "pid": spawn_pid, "pgid": spawn_pid,
-                                    "pid_start": _proc_start(spawn_pid),
-                                    "owner_pid": owner_pid, "owner_start": owner_start,
-                                    "tmp_config": spawn_tmp, "log": spawn_log,
-                                    "project_id": project_id,
-                                    "started": _now(), "expires": time.time() + ttl}
-                self._save()
-
-            try:
-                pid, tmp, log, ports, check = self._boot(
-                    cwd, base, only, project_id, lid.replace(":", "-"), on_spawn,
-                    extra_env=env)
-            except Exception:
-                rec = self.leases.pop(lid, None)
-                if rec:
-                    self._cleanup(rec)
-                    self._save()
-                raise
-            # A leased simulator implies a metro port (the e2e dev-env wants both).
-            # The metro port lives in the lease's own 20-port block, so it's
-            # collision-free by construction and needs no health check.
-            if metro or sim:
-                ports["metro"] = base + METRO_OFFSET
-            if android_console:
-                ports["android_console"], ports["android_adb"] = android_console, android_console + 1
-            sim_udid = sim_name = None
-            if sim:
-                sim_name = lid.replace(":", "-")
-                try:
-                    sim_udid = _sim_create_boot(sim_device or DEFAULT_SIM_DEVICE,
-                                                sim_runtime or DEFAULT_SIM_RUNTIME, sim_name)
-                except Exception:
-                    # Don't leak the emulators we just booted if the sim fails.
-                    self._cleanup(self.leases.pop(lid, None) or
-                                  {"pid": pid, "cwd": cwd, "tmp_config": tmp, "block": base})
-                    self._save()
-                    raise
-            self.leases[lid] = {"leaseId": lid, "kind": "acquired", "cwd": cwd, "block": base,
-                                "ports": ports, "check_ports": check, "pid": pid,
-                                "pgid": pid, "pid_start": _proc_start(pid),
-                                "owner_pid": owner_pid, "owner_start": owner_start,
-                                "tmp_config": tmp, "log": log, "project_id": project_id,
-                                "sim_udid": sim_udid, "sim_name": sim_name,
+            self.leases[lid] = {"leaseId": lid, "kind": "acquired",
+                                "state": "booting", "booting_since": time.time(),
+                                "cwd": cwd, "block": base,
+                                "ports": ({"android_console": android_console,
+                                           "android_adb": android_console + 1}
+                                          if android_console else {}),
+                                "pid": None, "owner_pid": owner_pid, "owner_start": owner_start,
+                                "project_id": project_id,
                                 "started": _now(), "expires": time.time() + ttl}
             self._save()
-            resp = {"leaseId": lid, "ports": ports, "projectId": project_id}
-            if sim_udid:
-                resp["sim"] = {"udid": sim_udid, "name": sim_name}
-            return resp
+
+        def on_spawn(spawn_pid, spawn_tmp, spawn_log):
+            # Provisional record, saved before the readiness wait: a daemon
+            # crash mid-boot must leave a findable lease, not a ghost suite.
+            with self.lock:
+                l = self.leases.get(lid)
+                if l is None:
+                    # Reaped between the draw and the spawn (owner died).
+                    try:
+                        os.killpg(spawn_pid, signal.SIGKILL)
+                    except (OSError, ProcessLookupError):
+                        pass
+                    raise RuntimeError(f"lease {lid} was reaped while it booted")
+                l.update({"pid": spawn_pid, "pgid": spawn_pid,
+                          "pid_start": _proc_start(spawn_pid),
+                          "tmp_config": spawn_tmp, "log": spawn_log})
+                self._save()
+
+        try:
+            pid, tmp, log, ports, check = self._boot(
+                cwd, base, only, project_id, lid.replace(":", "-"), on_spawn,
+                extra_env=env)
+        except Exception:
+            with self.lock:
+                rec = self._retire(lid, f"boot of {lid} failed")
+            self._drain([rec])
+            raise
+        # A leased simulator implies a metro port (the e2e dev-env wants both).
+        # The metro port lives in the lease's own 20-port block, so it's
+        # collision-free by construction and needs no health check.
+        if metro or sim:
+            ports["metro"] = base + METRO_OFFSET
+        if android_console:
+            ports["android_console"], ports["android_adb"] = android_console, android_console + 1
+        sim_udid = sim_name = None
+        if sim:
+            sim_name = lid.replace(":", "-")
+            with self.lock:
+                l = self.leases.get(lid)
+                if l is not None:
+                    # The sim phase gets its own window, and its name, so the
+                    # world sweep knows the device it is about to see is ours.
+                    l["booting_since"], l["sim_name"] = time.time(), sim_name
+            try:
+                sim_udid = _sim_create_boot(sim_device or DEFAULT_SIM_DEVICE,
+                                            sim_runtime or DEFAULT_SIM_RUNTIME, sim_name)
+            except Exception:
+                # Don't leak the emulators we just booted if the sim fails.
+                with self.lock:
+                    rec = self._retire(lid, f"sim for {lid} failed")
+                self._drain([rec])
+                raise
+        rec = {"leaseId": lid, "kind": "acquired", "cwd": cwd, "block": base,
+               "ports": ports, "check_ports": check, "pid": pid,
+               "pgid": pid, "pid_start": _proc_start(pid),
+               "owner_pid": owner_pid, "owner_start": owner_start,
+               "tmp_config": tmp, "log": log, "project_id": project_id,
+               "sim_udid": sim_udid, "sim_name": sim_name,
+               "started": _now(), "expires": time.time() + ttl}
+        with self.lock:
+            tree = (self.leases.get(lid) or {}).get("tree")
+            if tree:
+                rec["tree"] = tree
+            refused = self._commit(lid, rec, client_gone, rec)
+        if refused:
+            self._drain([rec])
+            raise RuntimeError(refused)
+        resp = {"leaseId": lid, "ports": ports, "projectId": project_id}
+        if sim_udid:
+            resp["sim"] = {"udid": sim_udid, "name": sim_name}
+        return resp
 
     def allocate(self, owner_pid, owner_start=None, ttl=DEFAULT_TTL, label=None,
                  metro=False, sim=False, sim_device=None, sim_runtime=None,
-                 spawn=None, spawn_cwd=None, android=False):
+                 spawn=None, spawn_cwd=None, android=False, client_gone=None):
+        lid = f"alloc:{uuid.uuid4().hex[:12]}"
+        sim_name = lid.replace(":", "-") if sim else None
         with self.lock:
             base = self._free_block()
-            lid = f"alloc:{uuid.uuid4().hex[:12]}"
             ports = {"base": base}
             # A reserved block can also carry the dev-env extras for callers that
             # boot their own emulators (or none at all): a Metro port and/or a
@@ -1179,11 +1303,36 @@ class Broker:
             # only discovers 5554..5584) but leased the same way.
             if android:
                 self._lease_android(ports)
-            sim_udid = sim_name = None
+            rec = {"leaseId": lid, "kind": "reserved", "cwd": spawn_cwd,
+                   "block": base, "ports": ports, "pid": None,
+                   "pgid": None, "pid_start": None,
+                   "owner_pid": owner_pid,
+                   "owner_start": owner_start, "tmp_config": None,
+                   "log": None, "spawn": spawn,
+                   "label": label, "sim_udid": None, "sim_name": sim_name,
+                   "started": _now(), "expires": time.time() + ttl}
+            if not sim and not spawn:
+                # Nothing slow to make: grant it here — unless the caller hung
+                # up while it waited for the lock.
+                if client_gone and client_gone():
+                    print(f"not granting {lid} ({label or 'no label'}): the client gave up waiting", flush=True)
+                    raise RuntimeError("client gave up before the lease was granted")
+                self.leases[lid] = rec
+                self._save()
+                print(f"leased {lid} ({label or 'no label'}): base {base}"
+                      f"{' android ' + str(ports['android_console']) if android else ''}", flush=True)
+                return {"leaseId": lid, "base": base, "ports": ports}
+            # Hold the block (and the sim's name) while the slow part runs
+            # outside the lock: the reaper reads a reserved lease with no pid
+            # and a closed block as live until its owner or TTL says otherwise.
+            self.leases[lid] = dict(rec)
+            self._save()
+        sim_udid = None
+        try:
             if sim:
-                sim_name = lid.replace(":", "-")
                 sim_udid = _sim_create_boot(sim_device or DEFAULT_SIM_DEVICE,
                                             sim_runtime or DEFAULT_SIM_RUNTIME, sim_name)
+                rec["sim_udid"] = sim_udid
             # --spawn: the DAEMON runs the lease's process (Metro, a dev server…),
             # so it survives the calling shell/agent/session. Its pid is the
             # lease's liveness; teardown killpgs it like a booted suite.
@@ -1201,60 +1350,57 @@ class Broker:
                 if sim_udid:
                     env["DETOX_UDID"] = sim_udid
                     env["DETOX_SIM_NAME"] = sim_name
-                try:
-                    with open(log, "w") as lf:
-                        proc = subprocess.Popen(["/bin/sh", "-c", spawn],
-                                                cwd=spawn_cwd or None, env=env,
-                                                stdout=lf, stderr=subprocess.STDOUT,
-                                                start_new_session=True)
-                    pid = proc.pid
-                except OSError:
-                    # Don't leak the simulator we just created if the spawn fails.
-                    if sim_udid:
-                        _sim_teardown(sim_udid)
-                    raise
-            android_note = f" android {ports['android_console']}" if android else ""
-            print(f"leased {lid} ({label or 'no label'}): base {base}"
-                  f"{f' sim {sim_name}' if sim_udid else ''}{android_note}"
-                  f"{f' spawned pid {pid}' if pid else ''}", flush=True)
-            self.leases[lid] = {"leaseId": lid, "kind": "reserved", "cwd": spawn_cwd,
-                                "block": base, "ports": ports, "pid": pid,
-                                "pgid": pid, "pid_start": _proc_start(pid) if pid else None,
-                                "owner_pid": owner_pid,
-                                "owner_start": owner_start, "tmp_config": None,
-                                "log": log, "spawn": spawn,
-                                "label": label, "sim_udid": sim_udid, "sim_name": sim_name,
-                                "started": _now(), "expires": time.time() + ttl}
-            self._save()
-            resp = {"leaseId": lid, "base": base, "ports": ports}
-            if sim_udid:
-                resp["sim"] = {"udid": sim_udid, "name": sim_name}
-            if pid:
-                resp["spawnedPid"] = pid
-                resp["log"] = log
-            return resp
+                with open(log, "w") as lf:
+                    proc = subprocess.Popen(["/bin/sh", "-c", spawn],
+                                            cwd=spawn_cwd or None, env=env,
+                                            stdout=lf, stderr=subprocess.STDOUT,
+                                            start_new_session=True)
+                pid = proc.pid
+                rec.update({"pid": pid, "pgid": pid, "pid_start": _proc_start(pid), "log": log})
+        except Exception:
+            # Don't leak the simulator we just created if the spawn fails.
+            with self.lock:
+                self.leases.pop(lid, None)
+                self.draining[lid] = rec
+            self._drain([rec])
+            raise
+        with self.lock:
+            refused = self._commit(lid, rec, client_gone, rec)
+        if refused:
+            self._drain([rec])
+            raise RuntimeError(refused)
+        android_note = f" android {ports['android_console']}" if android else ""
+        print(f"leased {lid} ({label or 'no label'}): base {base}"
+              f"{f' sim {sim_name}' if sim_udid else ''}{android_note}"
+              f"{f' spawned pid {pid}' if pid else ''}", flush=True)
+        resp = {"leaseId": lid, "base": base, "ports": ports}
+        if sim_udid:
+            resp["sim"] = {"udid": sim_udid, "name": sim_name}
+        if pid:
+            resp["spawnedPid"] = pid
+            resp["log"] = log
+        return resp
 
     def release(self, lid):
         with self.lock:
-            rec = self.leases.pop(lid, None)
+            rec = self.leases.get(lid)
             if not rec:
                 return {"released": False, "reason": "unknown lease"}
-            print(f"released {lid} ({rec.get('label') or rec.get('cwd') or 'no label'})", flush=True)
-            self._cleanup(rec)
+            self._retire(lid, f"released {lid} ({rec.get('label') or rec.get('cwd') or 'no label'})")
             self._save()
-            return {"released": True}
+        self._drain([rec])
+        return {"released": True}
 
     def release_owned(self, owner_pid, cwd=None):
         with self.lock:
-            n = 0
+            recs = []
             for lid in list(self.leases):
                 l = self.leases[lid]
                 if l.get("owner_pid") == owner_pid and (cwd is None or l.get("cwd") == cwd):
-                    print(f"released {lid} (owner {owner_pid} asked)", flush=True)
-                    self._cleanup(self.leases.pop(lid))
-                    n += 1
+                    recs.append(self._retire(lid, f"released {lid} (owner {owner_pid} asked)"))
             self._save()
-            return {"released": n}
+        self._drain(recs)
+        return {"released": len(recs)}
 
     def reown(self, lid, owner_pid, owner_start=None):
         """Hand a lease to another owner. A daemon leases a run's block before it
@@ -1290,30 +1436,38 @@ class Broker:
                                 "sim": l.get("sim_udid"), "expires": l.get("expires"),
                                 "label": l.get("label"), "log": l.get("log")}
                                for l in self.leases.values()],
+                    # Torn down right now, outside the lock; their blocks
+                    # return to the pool when it finishes.
+                    "draining": sorted(self.draining),
                     # What the idle-simulator sweep last saw and did (SSB's Hosts
                     # card reads it: a leak is a number, not a chart to diagnose).
                     "idleSims": getattr(self, "_idle_sims", None),
                     "companions": getattr(self, "_companions", None)}
 
     def reap(self):
+        now = time.time()
         with self.lock:
-            now = time.time()
+            # Under the lock only the verdict and the bookkeeping; every
+            # teardown runs after it is released (_drain).
+            retired = []
             for lid in list(self.leases):
                 reason = self._dead_reason(self.leases[lid], now)
                 if reason:
                     # The routine reap path used to be silent — weeks of leaked
                     # JVMs left zero trace. Every reap states its reason.
-                    print(f"reaping {lid}: {reason}", flush=True)
-                    self._cleanup(self.leases.pop(lid))
-            # Runs on the tick, not just at startup: the tree must be observed
-            # WHILE the parents live — after a root dies its detached children
-            # read ppid 1 and can never be attributed again.
-            self._record_trees()
-            self._reap_deleted_sims(now)
+                    retired.append(self._retire(lid, f"reaping {lid}: {reason}"))
             self._save()
-            if now - getattr(self, "_swept", 0) >= SWEEP_INTERVAL:
-                self._swept = now
-                self._sweep_world(apply=True)
+        self._drain(retired)
+        # Runs on the tick, not just at startup: the tree must be observed
+        # WHILE the parents live — after a root dies its detached children
+        # read ppid 1 and can never be attributed again.
+        self._record_trees()
+        self._drain(self._reap_deleted_sims(now))
+        with self.lock:
+            self._save()
+        if now - getattr(self, "_swept", 0) >= SWEEP_INTERVAL:
+            self._swept = now
+            self._sweep_world(apply=True)
 
     def _reap_deleted_sims(self, now):
         """Reap leases whose simulator was deleted externally (Xcode cleanup,
@@ -1321,22 +1475,26 @@ class Broker:
         caller even though its process is healthy; reaping it WHOLE (killing
         the spawn too) prevents the half-alive ghost: sim gone, Metro still
         squatting its port, callers 'reusing' a session Detox can't drive.
-        Throttled — one simctl listing per SIM_CHECK_INTERVAL, not per lease."""
+        Throttled — one simctl listing per SIM_CHECK_INTERVAL, not per lease.
+        Returns the retired records; the caller drains them outside the lock."""
         if now - getattr(self, "_sims_checked", 0) < SIM_CHECK_INTERVAL:
-            return
-        sim_leases = [lid for lid, l in self.leases.items() if l.get("sim_udid")]
+            return []
+        with self.lock:
+            sim_leases = {lid: l["sim_udid"] for lid, l in self.leases.items() if l.get("sim_udid")}
         if not sim_leases:
             self._sims_checked = now
-            return
-        udids = _sim_udids()
+            return []
+        udids = _sim_udids()                    # simctl, outside the lock
         if udids is None:
-            return                        # indeterminate — no evidence, retry next pass
+            return []                           # indeterminate — no evidence, retry next pass
         self._sims_checked = now
-        for lid in sim_leases:
-            l = self.leases.get(lid)
-            if l and l["sim_udid"] not in udids:
-                print(f"reaping {lid}: sim {l['sim_udid']} deleted externally", flush=True)
-                self._cleanup(self.leases.pop(lid))
+        retired = []
+        with self.lock:
+            for lid, udid in sim_leases.items():
+                l = self.leases.get(lid)
+                if l and l.get("sim_udid") == udid and udid not in udids:
+                    retired.append(self._retire(lid, f"reaping {lid}: sim {udid} deleted externally"))
+        return retired
 
     def verify(self, lid):
         """Full-liveness check for one lease, for callers deciding whether to
@@ -1347,20 +1505,21 @@ class Broker:
             l = self.leases.get(lid)
             if not l:
                 return {"ok": False, "reasons": ["unknown lease"]}
-            reasons = []
-            pid = l.get("pid")
-            if pid and not _child_alive(pid):
-                reasons.append(f"process {pid} dead")
-            if l.get("sim_udid"):
-                udids = _sim_udids()
-                if udids is not None and l["sim_udid"] not in udids:
-                    reasons.append(f"sim {l['sim_udid']} gone")
-            if l["kind"] == "acquired":
-                down = [s for s, p in (l.get("check_ports") or _service_ports(l["ports"])).items()
-                        if not _port_open(p)]
-                if down:
-                    reasons.append("ports down: " + ",".join(sorted(down)))
-            return {"ok": not reasons, "reasons": reasons}
+            l = dict(l)                         # probed outside the lock (simctl)
+        reasons = []
+        pid = l.get("pid")
+        if pid and not _child_alive(pid):
+            reasons.append(f"process {pid} dead")
+        if l.get("sim_udid"):
+            udids = _sim_udids()
+            if udids is not None and l["sim_udid"] not in udids:
+                reasons.append(f"sim {l['sim_udid']} gone")
+        if l["kind"] == "acquired":
+            down = [s for s, p in (l.get("check_ports") or _service_ports(l["ports"])).items()
+                    if not _port_open(p)]
+            if down:
+                reasons.append("ports down: " + ",".join(sorted(down)))
+        return {"ok": not reasons, "reasons": reasons}
 
     def _sweep_world(self, apply):
         """The other half of reconciliation: find resources that exist in the
@@ -1384,16 +1543,18 @@ class Broker:
         daemons on one box deleting each other's devices.
         Returns findings for `doctor`."""
         findings = []
-        lease_pids = {int(l["pid"]) for l in self.leases.values() if l.get("pid")}
-        # The authorship ledger: every (pid, start) any live lease's tree has
+        # Snapshot under the lock; scan (lsof, ps, simctl) and act outside it.
+        # Every eviction is re-checked against the ledger as it stands just
+        # before the kill (below), so a lease granted mid-scan is never swept.
+        with self.lock:
+            held = self._held_sets()
+        lease_pids = held["pids"]
+        # The authorship ledger: every (pid, start) any held lease's tree has
         # recorded. Eviction requires membership here — start re-checked so a
         # recycled pid never matches — or a cmdline that names the injected
         # config file only harbormaster writes. Anything else is somebody
         # else's process wearing a familiar name: reported, never signalled.
-        authored = {}
-        for l in self.leases.values():
-            for pid, start in (l.get("tree") or {}).items():
-                authored[int(pid)] = start
+        authored = held["authored"]
 
         def _attributed(pid, cmdline=""):
             if ".firebase.brokered-" in cmdline:
@@ -1401,14 +1562,7 @@ class Broker:
             start = authored.get(pid)
             return bool(start) and _proc_start(pid) == start
 
-        leased_ports = set()
-        for l in self.leases.values():
-            if l.get("block"):
-                leased_ports |= {l["block"] + off for off in range(BLOCK)}
-        for l in self.leases.values():
-            for k in ("android_console", "android_adb"):
-                if isinstance((l.get("ports") or {}).get(k), int):
-                    leased_ports.add(l["ports"][k])
+        leased_ports = held["ports"]
         pool_end = POOL_BASE + POOL_BLOCKS * BLOCK
         for port, pids in _listeners().items():
             in_android = ANDROID_CONSOLE_FIRST <= port <= ANDROID_CONSOLE_LAST + 1
@@ -1437,17 +1591,29 @@ class Broker:
             pass
         inv = _sim_inventory()
         if inv is not None:
-            leased_udids = {l.get("sim_udid") for l in self.leases.values()}
+            leased_udids = held["udids"]
             mine = _authored_sims()
             for udid, name in inv.items():
                 if ((name.startswith("run-") or name.startswith("alloc-"))
-                        and udid not in leased_udids):
+                        and udid not in leased_udids and name not in held["names"]):
                     findings.append({"kind": "sim", "udid": udid, "name": name,
                                      "evict": udid in mine})
         if apply:
-            self._sweep_idle_sims(inv)
+            self._sweep_idle_sims(inv, held["udids"])
             self._sweep_companions(inv)
         if apply and findings:
+            with self.lock:
+                now_held = self._held_sets()
+            for f in findings:
+                if not f.get("evict"):
+                    continue
+                if f["kind"] == "sim":
+                    claimed = f["udid"] in now_held["udids"] or f["name"] in now_held["names"]
+                else:
+                    claimed = (f["pid"] in now_held["pids"]
+                               or f.get("port") in now_held["ports"])
+                if claimed:
+                    f["evict"] = False           # leased since the scan began
             pids = {f["pid"] for f in findings
                     if f["kind"] in ("listener", "orphan") and f.get("evict")}
             if pids:
@@ -1482,7 +1648,7 @@ class Broker:
                           + f" — {f['cmd']}", flush=True)
         return findings
 
-    def _sweep_idle_sims(self, inv):
+    def _sweep_idle_sims(self, inv, leased_udids):
         """Shut down booted simulators no lease holds that have sat idle past
         IDLE_SIM_HOURS. Shutdown only — the device and its data stay, and its
         owner boots it again. Recorded for status whatever it finds."""
@@ -1493,7 +1659,7 @@ class Broker:
         except (subprocess.SubprocessError, OSError):
             return
         booted = _booted_sims(r.stdout)
-        leased = {str(l.get("sim_udid")).upper() for l in self.leases.values() if l.get("sim_udid")}
+        leased = {str(u).upper() for u in leased_udids}
         names = {u.upper(): n for u, n in (inv or {}).items()}
         idle = idle_unleased_sims(booted, leased, names)
         done = []
@@ -1554,10 +1720,9 @@ class Broker:
     def doctor(self, fix=False):
         """Report (and with fix=True, evict) everything the sweep can see —
         the command that would have made 51 orphaned JVMs visible on day one."""
-        with self.lock:
-            findings = self._sweep_world(apply=fix)
-            return {"findings": findings, "fixed": bool(fix and findings),
-                    "leases": len(self.leases)}
+        findings = self._sweep_world(apply=fix)
+        return {"findings": findings, "fixed": bool(fix and findings),
+                "leases": len(self.leases)}
 
 
 class _Handler(http.server.BaseHTTPRequestHandler):
@@ -1581,6 +1746,19 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             return {}
 
+    def _client_gone(self):
+        """True once the caller has closed its end: it gave up waiting (its
+        own timeout fired) and will never read the answer. A request body is
+        fully read before we get here, so a readable socket that peeks empty
+        is the FIN — not a second request."""
+        try:
+            r, _, _ = select.select([self.connection], [], [], 0)
+            if not r:
+                return False
+            return self.connection.recv(1, socket.MSG_PEEK) == b""
+        except (OSError, ValueError):
+            return True
+
     def do_GET(self):
         if self.path == "/health":
             return self._send(200, {"ok": True, "version": VERSION})
@@ -1596,14 +1774,16 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                                                  d.get("only"), d.get("ttl", DEFAULT_TTL),
                                                  d.get("metro", False), d.get("sim", False),
                                                  d.get("sim_device"), d.get("sim_runtime"),
-                                                 d.get("env"), d.get("android", False)))
+                                                 d.get("env"), d.get("android", False),
+                                                 client_gone=self._client_gone))
             if self.path == "/allocate":
                 return self._send(200, b.allocate(d.get("owner_pid"), d.get("owner_start"),
                                                   d.get("ttl", DEFAULT_TTL), d.get("label"),
                                                   d.get("metro", False), d.get("sim", False),
                                                   d.get("sim_device"), d.get("sim_runtime"),
                                                   d.get("spawn"), d.get("spawn_cwd"),
-                                                  d.get("android", False)))
+                                                  d.get("android", False),
+                                                  client_gone=self._client_gone))
             if self.path == "/release":
                 return self._send(200, b.release(d.get("leaseId")))
             if self.path == "/release-owned":

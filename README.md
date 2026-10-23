@@ -273,3 +273,13 @@ when its owner is alive. On 2026-10-22 a resumed story's suite was dark for over
 daemon that owned it, re-leased, and the next run's port sweep killed the
 story's emulators mid-scene. The owner's death still reaps at once. Tested by
 `python3 test/owned_grace.py`.
+
+## A run takes its block over from the daemon that leased it (0.16.0)
+
+`harbormaster reown <leaseId> [--owner PID]` (`POST /reown`) hands a live lease
+to another live owner. A daemon leases a run's block before spawning the run, so
+the daemon owned it; on 2026-10-22 a fleet restart mid-story let the next daemon
+adopt the run, but the block was reaped the moment the old daemon exited and the
+port sweep killed the story's emulators in scene 3. The run now reowns its block
+at startup, so the block lives exactly as long as the run. Tested by
+`python3 test/reown.py`.

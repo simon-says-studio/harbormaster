@@ -309,3 +309,19 @@ just leased. The port is now the broker's mutex: a loser exits before touching
 the ledger or the managed marker. The ledger and sims-registry temp files are
 per writer, so no two writers can interleave into one.
 `python3 test/serve_bind_first.py`.
+
+## With a managed service installed, a client never starts its own broker (0.18.0)
+
+The managed marker says a managed broker is serving *now*, and goes stale
+whenever the service is down. On the studio (2026-10-23, after a reboot) a
+client found it stale and started a plain `serve`. That broker held port 4999
+from then on, and launchd's managed broker crash-looped behind it for 50
+minutes. `serve --managed --unit <path>` now records the service's unit file
+(`managed-service.json` in the state dir). While that file exists, a client:
+- never starts a broker of its own: it waits up to 2 minutes for the service,
+  then fails naming the unit;
+- never replaces a broker that is serving, managed or not: evicting a stray is
+  the installer's job.
+
+Deleting the unit (uninstalling the service) restores the old behaviour.
+`python3 test/managed_unit.py`.

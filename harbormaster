@@ -94,7 +94,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.17.1"
+VERSION = "0.18.0"
 
 # Overridable for tests / parallel installs; default is the shared user daemon.
 # The dir keeps the old "firebase-ports" name: pre-rename binaries still installed
@@ -1821,6 +1821,36 @@ MANAGED_MARK = STATE_DIR / "managed"
 MANAGED_FRESH_S = 300
 
 
+# WHICH SERVICE OWNS THE BROKER — durable, unlike the marker (0.18.0).
+#
+# The marker's freshness says a managed broker is serving NOW; it goes stale
+# whenever the service is down. On the studio (2026-10-23, after a reboot) the
+# service was down long enough that a client found a stale marker, started its
+# own `serve`, and held port 4999 from then on: launchd's managed broker
+# crash-looped behind it for 50 minutes. `serve --managed --unit <path>`
+# records the service's unit file here, and while that file exists a client
+# never starts a broker of its own: it waits for the service, then fails
+# loudly. Uninstalling the service (deleting its unit) lifts the rule.
+MANAGED_SERVICE = STATE_DIR / "managed-service.json"
+
+
+def _managed_unit():
+    """The installed service's unit file, if a managed broker declared one
+    and it is still installed; else None."""
+    try:
+        unit = json.loads(MANAGED_SERVICE.read_text()).get("unit")
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return None
+    return unit if unit and Path(unit).exists() else None
+
+
+def _declare_managed(unit):
+    try:
+        MANAGED_SERVICE.write_text(json.dumps({"unit": str(Path(unit).expanduser()), "version": VERSION}))
+    except OSError:
+        pass
+
+
 def _managed_recent():
     try:
         return time.time() - MANAGED_MARK.stat().st_mtime < MANAGED_FRESH_S
@@ -1835,7 +1865,7 @@ def _touch_managed():
         pass
 
 
-def cmd_serve(managed=False):
+def cmd_serve(managed=False, unit=None):
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     # BIND FIRST. Broker() is not inert: it loads the ledger, reaps dead
     # leases (deleting their sims), and saves. Until 0.17.1 it ran before the
@@ -1856,6 +1886,8 @@ def cmd_serve(managed=False):
         sys.exit(1)
     if managed:
         _touch_managed()
+        if unit:
+            _declare_managed(unit)
 
         def keep_marked():
             while True:
@@ -2015,10 +2047,14 @@ def _spawn_daemon():
 
 def _ensure():
     v = _daemon_version()
-    managed = _managed_recent()
+    unit = _managed_unit()
+    managed = _managed_recent() or bool(unit)
     if v is not None:
         # A managed broker is never replaced by a client: its service manager
-        # owns upgrades (restart it to pick up a new install).
+        # owns upgrades (restart it to pick up a new install). With a service
+        # installed, a broker that is NOT the managed one is not a client's to
+        # replace either: shutting it down and spawning another is one more
+        # stray. Whoever installed the service evicts it.
         if managed or _ver_tuple(v) >= _ver_tuple(VERSION):
             return
         # A newer client found an older daemon (e.g. a stale node_modules copy
@@ -2047,6 +2083,10 @@ def _ensure():
             if _up():
                 return
             time.sleep(0.1)
+        if unit:
+            raise RuntimeError(
+                f"the managed broker ({unit}) is installed but has not served for 120s — "
+                f"not starting a stray one beside it; see its log (start it with its service manager)")
         print("harbormaster: the managed broker did not come back in 120s — starting one here", file=sys.stderr)
     _spawn_daemon()
     for _ in range(50):
@@ -2136,7 +2176,7 @@ def _parse(args):
             elif a[2:] == "fn-env" and i + 1 < len(args):
                 opts.setdefault("fn-env", []).append(args[i + 1])
                 i += 1
-            elif a[2:] in ("cwd", "only", "ttl", "owner", "label", "sim-device", "sim-runtime", "spawn") and i + 1 < len(args):
+            elif a[2:] in ("cwd", "only", "ttl", "owner", "label", "sim-device", "sim-runtime", "spawn", "unit") and i + 1 < len(args):
                 opts[a[2:]] = args[i + 1]
                 i += 1
             else:
@@ -2166,7 +2206,7 @@ def main():
     if cmd == "version":
         print(VERSION)
     elif cmd == "serve":
-        cmd_serve(managed="managed" in flags)
+        cmd_serve(managed="managed" in flags, unit=opts.get("unit"))
     elif cmd in ("acquire", "up"):
         _ensure()
         pid, start = _owner(opts)

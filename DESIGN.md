@@ -124,6 +124,20 @@ before it was caught (2026-07-29). Teardown in v0.7 is therefore layered:
 4. Verify the block's ports are actually free, and log every action taken —
    a teardown that leaves a listener behind says so instead of pretending.
 
+**The lock guards the ledger, never the work** (v0.17). Teardown, the world
+sweep, `ps`/`lsof`/`simctl` scans, a suite's boot and a simulator's create all
+run outside the broker's lock. Under it a reap only takes the lease out of
+service and parks it in `draining`, whose block stays out of the pool until
+the teardown finishes (the port sweep would otherwise kill the next lease's
+processes on it); a boot or sim create first writes a provisional record that
+holds its block. The world sweep scans from a snapshot and re-checks each
+eviction against the ledger just before acting. Before v0.17 the reaper held
+the lock through every teardown, and on 2026-10-22 the studio's allocates
+queued behind it past the SSB daemon's 30s client timeout — seven failed
+previews and dev servers — and were then granted to nobody. Now a grant is
+refused (and what was made for it torn down) when the caller has closed its
+connection: an answer nobody reads is a block nobody will release.
+
 Beyond per-lease teardown, the daemon reconciles **both directions**: the ledger
 against the world (as before), and the world against the ledger — at startup and
 every `FBPORTS_SWEEP_INTERVAL` (300s) it looks for listeners on pool ports no

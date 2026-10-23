@@ -283,3 +283,16 @@ adopt the run, but the block was reaped the moment the old daemon exited and the
 port sweep killed the story's emulators in scene 3. The run now reowns its block
 at startup, so the block lives exactly as long as the run. Tested by
 `python3 test/reown.py`.
+
+## An allocate never waits behind a teardown (0.17.0)
+
+The broker's lock now guards only the ledger. Teardown (group kills, `simctl
+delete`, temp dirs), the world sweep, a suite's boot and a simulator's create
+all run outside it, so `allocate` answers in milliseconds however busy the
+reaper is. A block being torn down is `draining` (`status` lists them) and
+returns to the pool when its teardown ends. If the caller closes its
+connection before the grant (its own timeout fired), the broker refuses the
+grant and tears down whatever it made, instead of reserving a block nobody
+will release. On 2026-10-22 the studio's allocates queued behind the reaper
+past the SSB daemon's 30s timeout, seven times, and each was granted anyway.
+Tested by `python3 test/teardown_lock.py`.

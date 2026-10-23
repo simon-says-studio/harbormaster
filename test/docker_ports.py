@@ -32,6 +32,7 @@ check("nothing published parses to nothing", hm._parse_published("") == set())
 # A broker with no daemon behind it: no ledger, no reconcile.
 b = hm.Broker.__new__(hm.Broker)
 b.leases = {"a": {"block": hm.POOL_BASE + hm.BLOCK}}          # block 1 is leased
+b.draining = {}
 hm._port_open = lambda port, host="127.0.0.1": False           # nothing answers a connect
 hm._docker_published_ports = lambda: {hm.POOL_BASE + 4}       # docker holds a port in block 0
 check("a block docker publishes into is skipped, as is a leased one",

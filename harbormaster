@@ -94,7 +94,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.18.0"
+VERSION = "0.19.0"
 
 # Overridable for tests / parallel installs; default is the shared user daemon.
 # The dir keeps the old "firebase-ports" name: pre-rename binaries still installed
@@ -446,6 +446,24 @@ def _android_env(ports):
     return {"ANDROID_CONSOLE_PORT": str(c), "ANDROID_ADB_PORT": str(ports["android_adb"]),
             "ANDROID_SERIAL": f"emulator-{c}"}
 
+
+# The Firestore emulator is a JVM, and firebase-tools starts it with no heap
+# limit, so each one may grow to a quarter of the machine's RAM — and G1 rarely
+# hands committed heap back. 2026-11-03 on simon-linux-1 (89 GiB): 14 leased
+# suites held 50 GiB, four of them 7–9 GiB each, the box swapped out its 8 GiB
+# and the kernel OOM-killed CI test runners. A test sandbox holds kilobytes of
+# documents; a cap costs it a few more GCs, never correctness.
+#
+# FBPORTS_EMULATOR_HEAP (default 2g) caps it through JAVA_TOOL_OPTIONS, the one
+# knob that reaches a JVM firebase-tools launches; "0" or "off" leaves the JVM
+# alone. A caller's own -Xmx (already in JAVA_TOOL_OPTIONS) wins.
+DEFAULT_EMULATOR_HEAP = "2g"
+def emulator_java_env(env):
+    heap = str(env.get("FBPORTS_EMULATOR_HEAP", DEFAULT_EMULATOR_HEAP)).strip()
+    opts = env.get("JAVA_TOOL_OPTIONS", "").strip()
+    if heap.lower() in ("", "0", "off", "none") or re.search(r"(^|\s)-Xmx", opts):
+        return {}
+    return {"JAVA_TOOL_OPTIONS": (opts + " " if opts else "") + f"-Xmx{heap}"}
 
 def _with_ports(env, ports):
     return {k: _PORT_REF.sub(lambda m: str(ports[m.group(1)]) if m.group(1) in ports else m.group(0), v)
@@ -1032,6 +1050,7 @@ class Broker:
         spawn_env = {**os.environ, **_with_ports(project_env(cwd), all_ports), "TMPDIR": str(suite_tmp)}
         if extra_env:
             spawn_env.update(_with_ports({str(k): str(v) for k, v in dict(extra_env).items()}, all_ports))
+        spawn_env.update(emulator_java_env(spawn_env))
         with open(log, "w") as lf:
             proc = subprocess.Popen(cmd, cwd=cwd, stdout=lf, stderr=subprocess.STDOUT, start_new_session=True, env=spawn_env)
         if on_spawn:

@@ -94,7 +94,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.20.0"
+VERSION = "0.21.0"
 
 # Overridable for tests / parallel installs; default is the shared user daemon.
 # The dir keeps the old "firebase-ports" name: pre-rename binaries still installed
@@ -189,6 +189,19 @@ REAP_INTERVAL = int(os.environ.get("FBPORTS_REAP_INTERVAL", "10"))
 # is healthy — sweep it whole rather than leave a half-alive session.
 SIM_CHECK_INTERVAL = int(os.environ.get("FBPORTS_SIM_CHECK_INTERVAL", "60"))
 BOOT_BACKSTOP = 600          # only for a genuinely wedged boot; readiness is liveness-driven
+# Open ports are not a ready functions emulator (0.21.0). firebase-tools binds
+# every emulator's port first (registry.startEmulator), and only then runs each
+# one's connect(): the functions emulator's connect() loads the source and
+# registers every trigger with its emulator (a PUT per Firestore trigger to the
+# Firestore emulator). A write landing in between is never delivered to any
+# trigger — silently. Its end is the CLI's own "All emulators ready!" line,
+# printed once startAll (every connect() included) has returned. A suite with
+# functions in it waits for that line; one without never looks for it.
+# 2026-11-05, walk2gether-functions on an idle laptop: acquire returned 4.1s
+# before the triggers were registered, and the first three probe docs written
+# after it were never handled (a voice-walk simulation lost ~18s of writes).
+EMULATORS_READY_MARK = "All emulators ready!"
+FUNCTIONS_READY_TIMEOUT = int(os.environ.get("FBPORTS_FUNCTIONS_READY_TIMEOUT", "300"))
 # How often the daemon sweeps the WORLD for resources that escaped the ledger:
 # listeners on pool ports with no lease, orphaned firebase runtimes, stray sims.
 SWEEP_INTERVAL = int(os.environ.get("FBPORTS_SWEEP_INTERVAL", "300"))
@@ -396,6 +409,28 @@ def _owner_alive(pid, start):
     # (os.kill(0) just succeeded), so treat indeterminate as alive rather than
     # reaping a healthy lease.
     return not observed or observed == start
+
+
+class _LogMark:
+    """Has `mark` appeared in the log at `path` yet? Reads only what is new
+    each call (an impulse suite's log runs to megabytes), keeping the last
+    len(mark) chars so a mark split across two reads is still found."""
+    def __init__(self, path, mark):
+        self.path, self.mark, self.off, self.carry, self.seen = path, mark, 0, "", False
+
+    def __call__(self):
+        if not self.seen:
+            try:
+                with open(self.path, "rb") as f:
+                    f.seek(self.off)
+                    chunk = f.read()
+            except OSError:
+                return False
+            self.off += len(chunk)
+            text = self.carry + chunk.decode("utf-8", "replace")
+            self.seen = self.mark in text
+            self.carry = text[-len(self.mark):]
+        return self.seen
 
 
 def _tail(path, n=25):
@@ -1064,19 +1099,34 @@ class Broker:
         # Liveness-driven: keep waiting while the process is alive (a slow JVM is still
         # booting, not stuck); succeed when the ports open; fail if it exits; the
         # backstop only guards a genuinely wedged boot.
+        # With functions in the suite, open ports are only half of it: wait for
+        # the CLI to say its triggers are registered (EMULATORS_READY_MARK).
+        triggers_ready = _LogMark(log, EMULATORS_READY_MARK) if "functions" in check else (lambda: True)
         backstop = time.time() + BOOT_BACKSTOP
+        ports_open_at = None
+
+        def kill():
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)   # killpg → reap JVM children
+            except (OSError, ProcessLookupError):
+                pass
         while True:
-            if _all_open(check):
+            if ports_open_at is None and _all_open(check):
+                ports_open_at = time.time()
+            if ports_open_at is not None and triggers_ready():
                 return proc.pid, tmp, str(log), run_ports, check
             if proc.poll() is not None:
                 raise RuntimeError(f"emulators exited early; see {log}\n{_tail(log)}")
+            if ports_open_at is not None and time.time() > ports_open_at + FUNCTIONS_READY_TIMEOUT:
+                kill()
+                raise RuntimeError(
+                    f"functions emulator not ready: its ports opened {FUNCTIONS_READY_TIMEOUT}s ago "
+                    f"but firebase-tools never printed {EMULATORS_READY_MARK!r}, so its triggers "
+                    f"are not (all) registered and writes would go unhandled. Suite killed; see {log}\n{_tail(log)}")
             if time.time() > backstop:
-                try:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)   # killpg → reap JVM children
-                except (OSError, ProcessLookupError):
-                    pass
+                kill()
                 raise RuntimeError(f"boot backstop ({BOOT_BACKSTOP}s) hit, process still alive; see {log}")
-            time.sleep(1)
+            time.sleep(0.25 if ports_open_at is not None else 1)
 
     def _cleanup(self, rec):
         """Teardown frees the lease's RESOURCES — process group, ports, sim —

@@ -325,3 +325,17 @@ minutes. `serve --managed --unit <path>` now records the service's unit file
 
 Deleting the unit (uninstalling the service) restores the old behaviour.
 `python3 test/managed_unit.py`.
+
+## A suite with functions is ready when its triggers are (0.21.0)
+
+firebase-tools binds every emulator's port first and only then lets the
+functions emulator load its source and register its triggers with the Firestore
+(and other) emulators. Until 0.21.0 `acquire` returned on open ports, so a write
+made in that window was never delivered to any trigger, and nothing reported
+it. On 2026-11-05 a walk2gether voice-walk simulation lost about 18s of writes
+this way. When `functions` is in the suite, `acquire` now also waits for the
+CLI's own "All emulators ready!" line, which firebase-tools prints once every
+emulator's `connect()` (trigger registration included) has returned. If the line
+hasn't appeared `FBPORTS_FUNCTIONS_READY_TIMEOUT` seconds (default 300) after the
+ports opened, the suite is killed and `acquire` fails, saying so. A suite without
+functions is ready on open ports, as before. `python3 test/functions_ready.py`.

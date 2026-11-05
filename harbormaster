@@ -94,7 +94,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.19.0"
+VERSION = "0.20.0"
 
 # Overridable for tests / parallel installs; default is the shared user daemon.
 # The dir keeps the old "firebase-ports" name: pre-rename binaries still installed
@@ -939,6 +939,9 @@ class Broker:
                 if not _child_alive(l["pid"]):
                     return f"spawned pid {l['pid']} died"
                 return None
+            # Taken over by its run (reown): the owner's life is the lease's.
+            if l.get("held_by_run") and l.get("owner_pid") is not None:
+                return None
             # Caller boots its own — liveness on the block.
             base = l["block"]
             if _port_open(base) or _port_open(base + 1):
@@ -1440,6 +1443,15 @@ class Broker:
                 return {"ok": False, "reason": f"owner {owner_pid} is not alive"}
             l["owner_pid"] = int(owner_pid)
             l["owner_start"] = owner_start if owner_start is not None else _proc_start(int(owner_pid))
+            # Taken over by its run, the block lives exactly as long as that run:
+            # the owned grace below exists to bound a DAEMON keeping a block whose
+            # run has ended, and a run's own block is dark for long stretches by
+            # design (a fix's edit pass, then npm install, before its verify boots
+            # the suite). Reaped at 15 min dark, re-leased, and the next lease's
+            # port sweep killed the verify's live emulators: walk2gether fix jobs
+            # 2uYcPpMGwKmEil8W9SeG and oEcOyBFTUhvmEQ4bJzPo, 2026-11-04, all 14
+            # items unverifiable/ENVFAIL.
+            l["held_by_run"] = True
             self._save()
             return {"ok": True}
 

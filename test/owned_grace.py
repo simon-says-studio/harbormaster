@@ -37,7 +37,11 @@ check("owned, down past the owned grace: reaped",
       b._dead_reason(owned, 1000 + hm.OWNED_RECLAIM_GRACE) == "reserved block down past grace")
 check("no owner, down 45s: reaped as before",
       b._dead_reason(lease(), 1000 + hm.RECLAIM_GRACE) == "reserved block down past grace")
+held = lease(owner_pid=4242, held_by_run=True)
+check("taken over by its run, dark for an hour: kept (2026-11-04)", b._dead_reason(held, 1000 + 3600) is None)
 hm._owner_alive = lambda pid, start: False
+check("taken over by its run, owner gone: reaped at once",
+      (b._dead_reason(lease(owner_pid=4242, held_by_run=True), 1001) or "").startswith("owner pid 4242 gone"))
 check("owner gone: reaped at once", (b._dead_reason(lease(owner_pid=4242), 1001) or "").startswith("owner pid 4242 gone"))
 
 raise SystemExit(1 if failed else 0)

@@ -239,6 +239,33 @@ its ten cores with no app installed. Leases stopped only what they created.
 shutDown[]}`. The CLI prints a `simulators:` line. Tested by
 `python3 test/idle_sims.py`.
 
+## The box's simulator budget holds for every caller (0.22.0)
+
+harbormaster makes every private simulator on the box, so a budget set here
+holds for every caller: SSB's runs and rehearsals, CI's Detox suites, and a
+suite run by hand. Set it with `FBPORTS_MAX_SIMS`, or with `sim-budget.json`
+(`{"max": N}`) in the state dir. SSB's host agent writes that file from the
+host's `maxSimulators`. With no budget set, or one that can't be read, there is
+no gate, because an unknown budget is not "full".
+
+**What counts:** every booted simulator, leased or not, plus leases still
+making theirs. A leftover or someone's own device takes the same cores as a
+leased one. A leased device that is shut down costs nothing and does not count.
+
+**When there's no room:** an `acquire`/`allocate` with `--sim` that would pass
+the budget gets `503 {"wait": "simulators 4 of 4 in use on this box"}` right
+away, before anything is made. The client prints `waiting for a simulator: …`
+on stderr and asks again every `FBPORTS_SIM_WAIT_POLL` seconds (default 15).
+If `FBPORTS_SIM_WAIT` seconds pass (default 1800), it exits 75 (EX_TEMPFAIL,
+"try later"), which SSB re-queues. Leases without a simulator are never gated.
+
+On 2026-11-06 the Mac Studio ran 6–7 simulators beside their emulator stacks,
+with CPU at 75–98% all day and swap 98% full, and `simctl install`/`addmedia`
+stalled for minutes. SSB's scheduler had a budget, but CI and hand-run suites
+had none.
+
+`status` reports `simBudget {max, waits}`. Tested by `python3 test/sim_budget.py`.
+
 ## An idb companion whose simulator is gone is ended (0.14.0)
 
 idb starts one `idb_companion --udid <UDID>` per simulator it drives, with a

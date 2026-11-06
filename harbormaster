@@ -94,7 +94,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.21.0"
+VERSION = "0.22.0"
 
 # Overridable for tests / parallel installs; default is the shared user daemon.
 # The dir keeps the old "firebase-ports" name: pre-rename binaries still installed
@@ -210,6 +210,57 @@ SWEEP_INTERVAL = int(os.environ.get("FBPORTS_SWEEP_INTERVAL", "300"))
 # 2026-10-20: "Impulse-agent", booted outside any lease by an app's pinned
 # simulator name, held two of the Mac Studio's ten cores for 32 hours.
 IDLE_SIM_HOURS = float(os.environ.get("FBPORTS_IDLE_SIM_HOURS", "6"))
+
+# THE BOX'S SIMULATOR BUDGET (0.22.0). harbormaster makes every private
+# simulator on the box, so it is the one place a budget holds for EVERY caller —
+# SSB's runs and rehearsals, CI's Detox suites, a suite run by hand. Until now a
+# caller's own scheduler was the only gate, and CI had none: on 2026-11-06 the
+# Mac Studio ran 6-7 simulators beside their emulator stacks at 75-98% CPU all
+# day, swap 98% full, and simctl install/addmedia stalled for minutes.
+#
+# The budget is FBPORTS_MAX_SIMS, else sim-budget.json {"max": N} in the state
+# dir (SSB's host agent writes it from hosts/<id>.maxSimulators). Absent,
+# unreadable or <= 0: no gate — an unknown budget is not "full".
+# In use = every booted simulator (leased or not: a leftover or someone's own
+# device takes the same cores) plus leases still making theirs; a leased device
+# that is shut down costs nothing and does not count. A lease past the
+# budget is answered 503 {"wait": ...} at once, before anything is made; the
+# client says so and asks again until FBPORTS_SIM_WAIT seconds pass, then exits
+# 75 (EX_TEMPFAIL: "try later", which SSB re-queues). Nothing is half-made.
+SIM_BUDGET_FILE = STATE_DIR / "sim-budget.json"
+SIM_WAIT_S = int(os.environ.get("FBPORTS_SIM_WAIT", "1800"))
+SIM_WAIT_POLL = int(os.environ.get("FBPORTS_SIM_WAIT_POLL", "15"))
+
+
+def sim_budget():
+    """The box's simulator budget, or None for no gate (fail open)."""
+    try:
+        env = os.environ.get("FBPORTS_MAX_SIMS")
+        n = int(env) if env else json.loads(SIM_BUDGET_FILE.read_text()).get("max")
+    except Exception:
+        return None
+    return n if isinstance(n, int) and not isinstance(n, bool) and n > 0 else None
+
+
+def sims_in_use(booted, leased, authored, in_flight):
+    """Pure. Simulators counting against the budget: every BOOTED device,
+    leased or not, plus leases still making theirs. A leased device that is
+    shut down costs nothing (a story keeps only the phones it is using awake),
+    so it does not count. A lease mid-create may already be booted — a device
+    harbormaster authored that no lease holds yet — so those are not counted
+    twice."""
+    booted = {str(u).upper() for u in booted}
+    leased = {str(u).upper() for u in leased}
+    authored = {str(u).upper() for u in authored}
+    already_booted = len((booted & authored) - leased)
+    return len(booted) + max(0, in_flight - already_booted)
+
+
+class SimWait(Exception):
+    """No room in the box's simulator budget: the caller waits, said."""
+    def __init__(self, used, budget):
+        self.used, self.budget = used, budget
+        super().__init__(f"simulators {used} of {budget} in use on this box")
 # idb's per-simulator companions (0.14.0): one `idb_companion --udid <UDID>`
 # and its /tmp/idb/<UDID>_companion.sock per device it ever drove. A lease
 # deletes its simulator; nothing ended the companion. One older than the grace
@@ -1265,6 +1316,31 @@ class Broker:
         self._save()
         return None
 
+    def _sim_reading(self):
+        """The booted devices, read OUTSIDE the lock (ps is a process listing,
+        not a simctl call: cheap and never wedged by CoreSimulator). None when
+        it cannot be read — the gate then fails open."""
+        try:
+            r = subprocess.run(["ps", "-axo", "etime=,command="], capture_output=True, text=True, timeout=10)
+        except (subprocess.SubprocessError, OSError):
+            return None
+        return set(_booted_sims(r.stdout))
+
+    def _sim_gate(self, booted):
+        """Under self.lock: raise SimWait when one more simulator would pass
+        the budget. Leases still making theirs are counted from the ledger,
+        so two callers racing for the last place cannot both have it."""
+        budget = sim_budget()
+        self._sim_budget_seen = budget
+        if budget is None or booted is None:
+            return
+        leased = {l["sim_udid"] for l in self.leases.values() if l.get("sim_udid")}
+        in_flight = sum(1 for l in self.leases.values() if l.get("sim_wanted") and not l.get("sim_udid"))
+        used = sims_in_use(booted, leased, _authored_sims(), in_flight)
+        if used >= budget:
+            self._sim_waits = getattr(self, "_sim_waits", 0) + 1
+            raise SimWait(used, budget)
+
     def acquire(self, cwd, owner_pid, owner_start=None, only=None, ttl=DEFAULT_TTL,
                 metro=False, sim=False, sim_device=None, sim_runtime=None, env=None,
                 android=False, client_gone=None):
@@ -1274,7 +1350,10 @@ class Broker:
         # boot never queues every other caller.
         lid = f"run:{uuid.uuid4().hex[:12]}"
         project_id = _firebaserc_project(cwd)
+        booted = self._sim_reading() if sim else None
         with self.lock:
+            if sim:
+                self._sim_gate(booted)
             base = self._free_block()
             # Drawn before the boot, so an exhausted range costs no suite.
             android_console = self._free_android_console() if android else None
@@ -1285,7 +1364,7 @@ class Broker:
                                            "android_adb": android_console + 1}
                                           if android_console else {}),
                                 "pid": None, "owner_pid": owner_pid, "owner_start": owner_start,
-                                "project_id": project_id,
+                                "project_id": project_id, "sim_wanted": bool(sim),
                                 "started": _now(), "expires": time.time() + ttl}
             self._save()
 
@@ -1365,7 +1444,10 @@ class Broker:
                  spawn=None, spawn_cwd=None, android=False, client_gone=None):
         lid = f"alloc:{uuid.uuid4().hex[:12]}"
         sim_name = lid.replace(":", "-") if sim else None
+        booted = self._sim_reading() if sim else None
         with self.lock:
+            if sim:
+                self._sim_gate(booted)
             base = self._free_block()
             ports = {"base": base}
             # A reserved block can also carry the dev-env extras for callers that
@@ -1386,6 +1468,7 @@ class Broker:
                    "owner_start": owner_start, "tmp_config": None,
                    "log": None, "spawn": spawn,
                    "label": label, "sim_udid": None, "sim_name": sim_name,
+                   "sim_wanted": bool(sim),
                    "started": _now(), "expires": time.time() + ttl}
             if not sim and not spawn:
                 # Nothing slow to make: grant it here — unless the caller hung
@@ -1527,7 +1610,11 @@ class Broker:
                     # What the idle-simulator sweep last saw and did (SSB's Hosts
                     # card reads it: a leak is a number, not a chart to diagnose).
                     "idleSims": getattr(self, "_idle_sims", None),
-                    "companions": getattr(self, "_companions", None)}
+                    "companions": getattr(self, "_companions", None),
+                    # The box's simulator budget as the gate last read it, and
+                    # how many leases it has told to wait since the broker began.
+                    "simBudget": {"max": sim_budget(),
+                                  "waits": getattr(self, "_sim_waits", 0)}}
 
     def reap(self):
         now = time.time()
@@ -1885,6 +1972,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
                 return self._send(200, {"ok": True})
             self._send(404, {"error": "not found"})
+        except SimWait as w:
+            self._send(503, {"wait": str(w), "used": w.used, "max": w.budget})
         except Exception as e:
             self._send(500, {"error": str(e)})
 
@@ -2004,6 +2093,27 @@ def _call(method, path, body=None, timeout=BOOT_BACKSTOP + 60):   # client must 
     out = json.loads(resp.read() or b"{}")
     conn.close()
     return resp.status, out
+
+
+def _call_waiting(path, body, sleep=time.sleep, clock=time.monotonic, wait_s=None):
+    """POST a lease, waiting while the box's simulator budget is full: says so
+    on stderr (first time, then every two minutes) and asks again. Past
+    FBPORTS_SIM_WAIT, exit 75 — EX_TEMPFAIL, "try later", never a failure."""
+    wait_s = SIM_WAIT_S if wait_s is None else wait_s
+    start, said = clock(), None
+    while True:
+        st, out = _call("POST", path, body)
+        if st != 503 or "wait" not in out:
+            return st, out
+        waited = clock() - start
+        if waited >= wait_s:
+            print(f"no simulator after {int(waited)}s: {out['wait']} (FBPORTS_SIM_WAIT={wait_s})",
+                  file=sys.stderr)
+            sys.exit(75)
+        if said is None or clock() - said >= 120:
+            print(f"waiting for a simulator: {out['wait']}", file=sys.stderr, flush=True)
+            said = clock()
+        sleep(SIM_WAIT_POLL)
 
 
 def _up():
@@ -2291,7 +2401,7 @@ def main():
     elif cmd in ("acquire", "up"):
         _ensure()
         pid, start = _owner(opts)
-        _print(ok(_call("POST", "/acquire", {"cwd": _resolve_cwd(opts), "owner_pid": pid,
+        _print(ok(_call_waiting("/acquire", {"cwd": _resolve_cwd(opts), "owner_pid": pid,
                                              "owner_start": start, "only": only,
                                              "ttl": int(opts.get("ttl", DEFAULT_TTL)),
                                              "metro": "metro" in flags, "sim": "sim" in flags,
@@ -2332,7 +2442,7 @@ def main():
             pid, start = None, None
         else:
             pid, start = _owner(opts)
-        out = ok(_call("POST", "/allocate", {"owner_pid": pid, "owner_start": start,
+        out = ok(_call_waiting("/allocate", {"owner_pid": pid, "owner_start": start,
                                              "ttl": int(opts.get("ttl", DEFAULT_TTL)),
                                              "label": opts.get("label"),
                                              "metro": "metro" in flags, "sim": "sim" in flags,
